@@ -56,6 +56,10 @@ pub struct Config {
     /// provider wins.
     pub link_ttl: Duration,
     pub link_cache_capacity: usize,
+    /// Link fetches for distinct files that may wait at once. One more
+    /// fails at once with [`crate::Error::Busy`]: at `link_rate` a longer
+    /// queue only makes every caller wait longer.
+    pub max_pending_links: usize,
 }
 
 impl Config {
@@ -80,6 +84,7 @@ impl Config {
             stat_recheck_age: Duration::from_secs(5),
             link_ttl: Duration::from_secs(600),
             link_cache_capacity: 1024,
+            max_pending_links: 32,
         }
     }
 
@@ -103,7 +108,10 @@ impl Config {
         if self.list_concurrency == 0 || self.max_api_requests == 0 || self.max_transfers == 0 {
             return fail("concurrency limits must be at least 1");
         }
-        if self.listing_cache_capacity == 0 || self.link_cache_capacity == 0 {
+        if self.listing_cache_capacity == 0
+            || self.link_cache_capacity == 0
+            || self.max_pending_links == 0
+        {
             return fail("cache capacities must be at least 1");
         }
         Ok(())

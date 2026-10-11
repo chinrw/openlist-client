@@ -349,3 +349,71 @@ async fn a_provider_429_pauses_later_transfers_only() {
         start.elapsed()
     );
 }
+
+/// Link fetches whose callers went away must leave the queue: at one link a
+/// second, a burst of abandoned requests would otherwise make the next
+/// caller wait for every one of them.
+#[tokio::test]
+async fn abandoned_link_fetches_do_not_hold_up_the_next_caller() {
+    let server = start().await;
+    let files: Vec<_> = (0..20).map(|i| file(&format!("{i:02}.mp3"), 10)).collect();
+    server
+        .fake
+        .put("/w", [files, vec![file("next.mp3", 10)]].concat());
+    let mut config = server.config();
+    config.link_rate = 2.0;
+    let client = Client::new(config).unwrap();
+
+    for i in 0..20 {
+        let path = format!("/w/{i:02}.mp3");
+        let abandoned = tokio::time::timeout(Duration::from_millis(20), client.link(&path)).await;
+        assert!(
+            abandoned.is_err() || i == 0,
+            "only the first can be that fast"
+        );
+    }
+    let started = Instant::now();
+    client.link("/w/next.mp3").await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "waited {:?} behind abandoned fetches",
+        started.elapsed()
+    );
+    let abandoned_calls: usize = (0..20)
+        .map(|i| server.fake.hits("link", &format!("/w/{i:02}.mp3")))
+        .sum();
+    assert!(
+        abandoned_calls < 20,
+        "{abandoned_calls} abandoned fetches still ran"
+    );
+}
+
+/// Live callers each waiting on a different file are capped, so they cannot
+/// queue up without bound behind the provider's link rate.
+#[tokio::test]
+async fn distinct_pending_link_fetches_are_capped() {
+    let server = start().await;
+    let files: Vec<_> = (0..5).map(|i| file(&format!("{i}.mp3"), 10)).collect();
+    server.fake.put("/w", files);
+    *server.fake.link_delay.lock().unwrap() = Duration::from_millis(500);
+    let mut config = server.config();
+    config.max_pending_links = 4;
+    let client = std::sync::Arc::new(Client::new(config).unwrap());
+
+    let held: Vec<_> = (0..4)
+        .map(|i| {
+            let client = client.clone();
+            tokio::spawn(async move { client.link(&format!("/w/{i}.mp3")).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let error = client.link("/w/4.mp3").await.unwrap_err();
+    assert!(matches!(error, Error::Busy), "{error:?}");
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
+    // Joining a fetch already in flight is not a new one.
+    client.link("/w/0.mp3").await.unwrap();
+    for handle in held {
+        handle.await.unwrap().unwrap();
+    }
+    client.link("/w/4.mp3").await.unwrap();
+}

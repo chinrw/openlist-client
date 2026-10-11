@@ -42,6 +42,9 @@ pub enum Error {
     /// allows.
     #[error("OpenList is throttling requests beyond the wait budget")]
     RateLimited,
+    /// Too many link fetches for distinct files are already waiting.
+    #[error("too many link requests are waiting for OpenList")]
+    Busy,
     /// Pages of one listing did not add up to the reported total.
     #[error("listing of {path} is incomplete: got {got} of {total} entries")]
     Incomplete {
@@ -94,6 +97,7 @@ impl Error {
             | Self::Transport { .. }
             | Self::Login { .. }
             | Self::RateLimited
+            | Self::Busy
             | Self::Incomplete { .. }
             | Self::Protocol { .. } => ErrorKind::Unavailable,
         }

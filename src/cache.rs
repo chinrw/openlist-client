@@ -10,13 +10,13 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use futures_util::future::{BoxFuture, FutureExt, Shared};
-use tokio::time::Instant;
+use tokio::{task::AbortHandle, time::Instant};
 
 use crate::Error;
 
@@ -27,21 +27,81 @@ const MAX_TTL: Duration = Duration::from_secs(86_400);
 type SharedFetch<V> = Shared<BoxFuture<'static, Result<V, Error>>>;
 
 enum Slot<V> {
-    Ready { value: V, expires_at: Instant },
-    Pending { id: u64, fetch: SharedFetch<V> },
+    Ready {
+        value: V,
+        expires_at: Instant,
+    },
+    Pending {
+        id: u64,
+        fetch: SharedFetch<V>,
+        state: Arc<FetchState>,
+    },
+}
+
+/// What a fetch's callers share, apart from its slot: an invalidation can
+/// drop the slot while callers still wait, and the last of them must still
+/// be able to abort it.
+struct FetchState {
+    /// Callers still waiting. Changed only under the slots lock, so a
+    /// caller joining and the last one leaving cannot race.
+    waiters: AtomicUsize,
+    abort: AbortHandle,
 }
 
 pub(crate) struct Cache<V> {
     slots: Mutex<HashMap<String, Slot<V>>>,
     capacity: usize,
+    /// Fetches allowed to be in flight at once.
+    max_pending: usize,
+    /// Fetches in flight, counted by the fetch tasks themselves. Slots are
+    /// not counted, because an invalidation removes a slot while its fetch
+    /// keeps running for the callers already waiting.
+    outstanding: Arc<AtomicUsize>,
     next_id: AtomicU64,
 }
 
+/// Held by a fetch task, so the count drops when it finishes or is aborted.
+struct Outstanding(Arc<AtomicUsize>);
+
+impl Drop for Outstanding {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One caller waiting on a fetch. Dropping the last one aborts the fetch,
+/// which releases its admission permit: a fetch nobody waits for must not
+/// keep a place in the provider's rate-limited queue.
+struct Waiter<V: Clone + Send + Sync + 'static> {
+    cache: Weak<Cache<V>>,
+    key: String,
+    id: u64,
+    state: Arc<FetchState>,
+}
+
+impl<V: Clone + Send + Sync + 'static> Drop for Waiter<V> {
+    fn drop(&mut self) {
+        let cache = self.cache.upgrade();
+        let mut slots = cache.as_ref().map(|cache| cache.slots());
+        if self.state.waiters.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        self.state.abort.abort();
+        if let Some(slots) = slots.as_mut()
+            && matches!(slots.get(&self.key), Some(Slot::Pending { id, .. }) if *id == self.id)
+        {
+            slots.remove(&self.key);
+        }
+    }
+}
+
 impl<V: Clone + Send + Sync + 'static> Cache<V> {
-    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+    pub(crate) fn new(capacity: usize, max_pending: usize) -> Arc<Self> {
         Arc::new(Self {
             slots: Mutex::new(HashMap::new()),
             capacity,
+            max_pending,
+            outstanding: Arc::new(AtomicUsize::new(0)),
             next_id: AtomicU64::new(0),
         })
     }
@@ -66,22 +126,38 @@ impl<V: Clone + Send + Sync + 'static> Cache<V> {
     ///
     /// All callers waiting on one fetch get the same result, errors
     /// included, so a failure is not retried once per waiter. Errors are
-    /// never cached.
+    /// never cached. When every caller has gone, the fetch is aborted.
+    ///
+    /// # Errors
+    /// [`Error::Busy`] when `max_pending` fetches of other keys are in
+    /// flight, or the fetch's own error.
     pub(crate) async fn get_or_fetch<F>(self: &Arc<Self>, key: &str, fetch: F) -> Result<V, Error>
     where
         F: Future<Output = Result<(V, Duration), Error>> + Send + 'static,
     {
-        let shared = {
+        let (shared, _waiter) = {
             let mut slots = self.slots();
-            match slots.get(key) {
+            match slots.get_mut(key) {
                 Some(Slot::Ready { value, expires_at }) if *expires_at > Instant::now() => {
                     return Ok(value.clone());
                 }
-                Some(Slot::Pending { fetch, .. }) => fetch.clone(),
-                _ => self.start(&mut slots, key, fetch),
+                Some(Slot::Pending { id, fetch, state }) => {
+                    state.waiters.fetch_add(1, Ordering::SeqCst);
+                    (fetch.clone(), self.waiter(key, *id, state))
+                }
+                _ => self.start(&mut slots, key, fetch)?,
             }
         };
         shared.await
+    }
+
+    fn waiter(self: &Arc<Self>, key: &str, id: u64, state: &Arc<FetchState>) -> Waiter<V> {
+        Waiter {
+            cache: Arc::downgrade(self),
+            key: key.to_owned(),
+            id,
+            state: Arc::clone(state),
+        }
     }
 
     /// Starts `fetch` even if a value is cached or a fetch is in flight, and
@@ -91,30 +167,42 @@ impl<V: Clone + Send + Sync + 'static> Cache<V> {
     where
         F: Future<Output = Result<(V, Duration), Error>> + Send + 'static,
     {
-        let shared = self.start(&mut self.slots(), key, fetch);
+        let (shared, _waiter) = self.start(&mut self.slots(), key, fetch)?;
         shared.await
     }
 
+    /// Starts `fetch` as the slot's fetch, with the caller as its first
+    /// waiter.
     fn start<F>(
         self: &Arc<Self>,
         slots: &mut HashMap<String, Slot<V>>,
         key: &str,
         fetch: F,
-    ) -> SharedFetch<V>
+    ) -> Result<(SharedFetch<V>, Waiter<V>), Error>
     where
         F: Future<Output = Result<(V, Duration), Error>> + Send + 'static,
     {
+        // Checked and taken under the slots lock, so two callers cannot both
+        // take the last place.
+        if self.outstanding.load(Ordering::SeqCst) >= self.max_pending {
+            return Err(Error::Busy);
+        }
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+        let outstanding = Outstanding(Arc::clone(&self.outstanding));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cache = Arc::downgrade(self);
         let owned_key = key.to_owned();
-        // The fetch runs in its own task, so it finishes and releases its
-        // admission permit even when every caller is cancelled. Kept inside
-        // the slot unpolled, it would hold the permit forever.
+        // The fetch runs in its own task, so one caller being cancelled does
+        // not cancel it for the others. When the last caller goes, the
+        // `Waiter` aborts the task, which drops its admission permit; kept
+        // in the slot unpolled instead, it would hold the permit forever.
         let task = tokio::spawn(async move {
+            let _outstanding = outstanding;
             let result = fetch.await;
             finish(&cache, &owned_key, id, &result);
             result.map(|(value, _)| value)
         });
+        let abort = task.abort_handle();
         let path = key.to_owned();
         let shared = async move {
             task.await
@@ -122,14 +210,22 @@ impl<V: Clone + Send + Sync + 'static> Cache<V> {
         }
         .boxed()
         .shared();
+        // A fetch this one replaces (a forced refresh) keeps running for
+        // its own callers, and their waiters no longer find its slot.
+        let state = Arc::new(FetchState {
+            waiters: AtomicUsize::new(1),
+            abort,
+        });
+        let waiter = self.waiter(key, id, &state);
         slots.insert(
             key.to_owned(),
             Slot::Pending {
                 id,
                 fetch: shared.clone(),
+                state,
             },
         );
-        shared
+        Ok((shared, waiter))
     }
 
     /// Drops the key. A fetch in flight still answers its waiters but its
@@ -234,7 +330,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn concurrent_callers_share_one_fetch() {
-        let cache = Cache::new(16);
+        let cache = Cache::new(16, usize::MAX);
         let calls = Arc::new(AtomicUsize::new(0));
         let (a, b, c) = tokio::join!(
             cache.get_or_fetch("k", counted(&calls, 1)),
@@ -252,7 +348,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn values_expire_after_their_ttl() {
-        let cache = Cache::new(16);
+        let cache = Cache::new(16, usize::MAX);
         let calls = Arc::new(AtomicUsize::new(0));
         cache.get_or_fetch("k", counted(&calls, 1)).await.unwrap();
         tokio::time::sleep(TTL).await;
@@ -266,7 +362,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn errors_reach_every_waiter_and_are_not_cached() {
-        let cache: Arc<Cache<u32>> = Cache::new(16);
+        let cache: Arc<Cache<u32>> = Cache::new(16, usize::MAX);
         let calls = Arc::new(AtomicUsize::new(0));
         let failing = || {
             let calls = Arc::clone(&calls);
@@ -289,7 +385,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn invalidation_during_a_fetch_discards_its_result() {
-        let cache = Cache::new(16);
+        let cache = Cache::new(16, usize::MAX);
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let cache = Arc::clone(&cache);
@@ -312,7 +408,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn eviction_keeps_the_newest_entries_within_capacity() {
-        let cache = Cache::new(8);
+        let cache = Cache::new(8, usize::MAX);
         for i in 0..20u32 {
             let ttl = TTL + Duration::from_secs(u64::from(i));
             cache
@@ -330,7 +426,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn zero_ttl_is_not_stored_and_huge_ttl_does_not_overflow() {
-        let cache = Cache::new(8);
+        let cache = Cache::new(8, usize::MAX);
         cache
             .get_or_fetch("k", fixed(1, Duration::ZERO))
             .await
@@ -344,23 +440,117 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_fetch_abandoned_by_every_caller_still_completes() {
-        let cache = Cache::new(8);
+    async fn a_fetch_abandoned_by_every_caller_is_aborted_and_frees_its_key() {
+        let cache = Cache::new(8, usize::MAX);
         let calls = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let slow = {
+            let finished = Arc::clone(&finished);
+            async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok((1, TTL))
+            }
+        };
         let caller = {
             let cache = Arc::clone(&cache);
-            let calls = Arc::clone(&calls);
-            tokio::spawn(async move { cache.get_or_fetch("k", counted(&calls, 1)).await })
+            tokio::spawn(async move { cache.get_or_fetch("k", slow).await })
         };
         tokio::time::sleep(Duration::from_millis(1)).await;
         caller.abort();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(cache.get("k"), Some(1));
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "the fetch was aborted");
+        assert_eq!(cache.get("k"), None);
+        // The key is free for the next caller, which starts its own fetch.
+        assert_eq!(
+            cache.get_or_fetch("k", counted(&calls, 2)).await.unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_keeps_running_while_any_caller_waits() {
+        let cache = Cache::new(8, usize::MAX);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spawn = |value| {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move { cache.get_or_fetch("k", counted(&calls, value)).await })
+        };
+        let (first, second) = (spawn(1), spawn(2));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        first.abort();
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalidated_fetch_still_counts_until_it_ends() {
+        let cache = Cache::new(8, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move { cache.get_or_fetch("a", counted(&calls, 1)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        cache.invalidate("a");
+        assert!(matches!(
+            cache.get_or_fetch("b", counted(&calls, 2)).await,
+            Err(Error::Busy)
+        ));
+        first.await.unwrap().unwrap();
+        assert_eq!(
+            cache.get_or_fetch("b", counted(&calls, 2)).await.unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalidated_fetch_is_still_aborted_when_its_callers_go() {
+        let cache = Cache::new(8, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move { cache.get_or_fetch("a", counted(&calls, 1)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        cache.invalidate("a");
+        first.abort();
+        tokio::task::yield_now().await;
+        // The abandoned fetch gave its place back.
+        assert_eq!(
+            cache.get_or_fetch("b", counted(&calls, 2)).await.unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_fetches_of_distinct_keys_are_capped() {
+        let cache = Cache::new(8, 2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spawn = |key: &'static str| {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move { cache.get_or_fetch(key, counted(&calls, 1)).await })
+        };
+        let (a, b) = (spawn("a"), spawn("b"));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(matches!(
+            cache.get_or_fetch("c", counted(&calls, 1)).await,
+            Err(Error::Busy)
+        ));
+        let joined = spawn("a");
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+        joined.await.unwrap().unwrap();
+        assert!(cache.get_or_fetch("c", counted(&calls, 1)).await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_fresh_fetch_replaces_the_value_unless_invalidated() {
-        let cache = Cache::new(8);
+        let cache = Cache::new(8, usize::MAX);
         let calls = Arc::new(AtomicUsize::new(0));
         cache.get_or_fetch("k", counted(&calls, 1)).await.unwrap();
         assert_eq!(cache.fetch_fresh("k", counted(&calls, 2)).await.unwrap(), 2);
