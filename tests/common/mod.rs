@@ -98,6 +98,11 @@ impl Fake {
         self.tree.lock().unwrap().insert(path.into(), entries);
     }
 
+    /// Makes a directory disappear, as an unmounted storage would.
+    pub fn remove(&self, path: &str) {
+        self.tree.lock().unwrap().remove(path);
+    }
+
     pub fn fault(&self, endpoint: &str, path: &str, fault: Fault) {
         self.faults
             .lock()
