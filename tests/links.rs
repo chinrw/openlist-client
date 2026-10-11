@@ -361,7 +361,10 @@ async fn abandoned_link_fetches_do_not_hold_up_the_next_caller() {
         .fake
         .put("/w", [files, vec![file("next.mp3", 10)]].concat());
     let mut config = server.config();
-    config.link_rate = 2.0;
+    // One link per 4 s: the 20 abandoned calls take about 0.4 s, far
+    // inside the first gap even on a loaded machine, and fetching them all
+    // would take 80 s.
+    config.link_rate = 0.25;
     let client = Client::new(config).unwrap();
 
     for i in 0..20 {
@@ -372,10 +375,11 @@ async fn abandoned_link_fetches_do_not_hold_up_the_next_caller() {
             "only the first can be that fast"
         );
     }
+    // It waits for the next slot, under 4 s, not behind 80 s of fetches.
     let started = Instant::now();
     client.link("/w/next.mp3").await.unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(30),
         "waited {:?} behind abandoned fetches",
         started.elapsed()
     );
