@@ -9,7 +9,9 @@ use std::{
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::{
     StatusCode,
-    header::{AUTHORIZATION, HeaderMap, LOCATION, RETRY_AFTER},
+    header::{
+        AUTHORIZATION, COOKIE, HeaderMap, HeaderValue, LOCATION, PROXY_AUTHORIZATION, RETRY_AFTER,
+    },
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -34,6 +36,8 @@ const MAX_ATTEMPTS: u32 = 3;
 /// Pause after a business code 429, which carries no Retry-After.
 const ENVELOPE_429_PAUSE: Duration = Duration::from_secs(60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// Redirects followed below OpenList before giving up, as reqwest's default.
+const MAX_REDIRECTS: usize = 10;
 /// Bytes of a failed response kept for logs.
 const ERROR_BODY_LIMIT: usize = 4096;
 
@@ -642,44 +646,62 @@ impl Inner {
         // The transfer slot comes first, so a request waiting for one does
         // not hold an API slot that listings need.
         let permit = self.transfer_slot(&mut budget).await?;
-        if !self.is_openlist(url) {
-            let response = self.send_transfer(url, headers, None).await?;
-            return Ok(Transfer::new(response, permit));
-        }
-        let (token, _) = self.token(&mut budget).await?;
-        let api_permit = loop {
-            let api_permit = self
-                .admission
-                .acquire(RequestClass::Link, &mut budget)
-                .await?;
-            // A provider pause that began while this request waited for its
-            // turn still applies, but is waited out without the API slot.
-            if self.admission.transfer_cooldown_left().is_zero() {
-                break api_permit;
+        let mut url = url.clone();
+        let mut token = None;
+        let mut hops = 0;
+        // Every hop below OpenList makes it call the provider, so each one
+        // goes through link admission and gives its API slot back as soon as
+        // OpenList answers. reqwest follows only the hops after that.
+        while self.is_openlist(&url) {
+            if hops == MAX_REDIRECTS {
+                return Err(Error::protocol(url.path(), "too many redirects"));
             }
+            hops += 1;
+            let token = match &token {
+                Some(token) => token,
+                None => &*token.insert(self.token(&mut budget).await?.0),
+            };
+            let api_permit = loop {
+                let api_permit = self
+                    .admission
+                    .acquire(RequestClass::Link, &mut budget)
+                    .await?;
+                // A provider pause that began while this request waited for
+                // its turn still applies, but is waited out without the API
+                // slot.
+                if self.admission.transfer_cooldown_left().is_zero() {
+                    break api_permit;
+                }
+                drop(api_permit);
+                self.admission.wait_transfer_cooldown(&mut budget).await?;
+            };
+            let mut hop_headers = headers.clone();
+            let token = HeaderValue::from_str(token)
+                .map_err(|_| Error::protocol(url.path(), "the token is not a valid header"))?;
+            hop_headers.insert(AUTHORIZATION, token);
+            let response = self
+                .first_hop
+                .get(url.clone())
+                .headers(hop_headers)
+                .send()
+                .await
+                .map_err(|error| Error::transport(url.path(), error))?;
             drop(api_permit);
-            self.admission.wait_transfer_cooldown(&mut budget).await?;
-        };
-        let first = self
-            .first_hop
-            .get(url.clone())
-            .headers(headers.clone())
-            .header(AUTHORIZATION, &token)
-            .send()
-            .await
-            .map_err(|error| Error::transport(url.path(), error))?;
-        // OpenList has answered, so the provider call it made is over. A
-        // redirect target or the body may take minutes and must not hold an
-        // API slot.
-        drop(api_permit);
-        self.observe_openlist_answer(&first);
-        let Some(next) = redirect_target(&first) else {
-            return Ok(Transfer::new(first, permit));
-        };
-        drop(first);
-        // Only a hop that stays below OpenList keeps the token.
-        let token = self.is_openlist(&next).then_some(token.as_str());
-        let response = self.send_transfer(&next, headers, token).await?;
+            self.observe_openlist_answer(&response);
+            let Some(next) = redirect_target(&response) else {
+                return Ok(Transfer::new(response, permit));
+            };
+            url = next;
+        }
+        let mut headers = headers.clone();
+        if hops > 0 {
+            // The request left OpenList, so credentials meant for it must not
+            // reach the provider, as reqwest's own redirect handling ensures.
+            for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION] {
+                headers.remove(name);
+            }
+        }
+        let response = self.send_transfer(&url, &headers).await?;
         Ok(Transfer::new(response, permit))
     }
 
@@ -699,19 +721,17 @@ impl Inner {
         }
     }
 
-    /// Sends a GET that follows redirects. reqwest drops Authorization when a
-    /// redirect leaves the host, so the provider never sees the token.
+    /// Sends a GET that follows redirects, which drop credentials when they
+    /// leave the host.
     async fn send_transfer(
         &self,
         url: &Url,
         headers: &HeaderMap,
-        token: Option<&str>,
     ) -> Result<reqwest::Response, Error> {
-        let mut request = self.transfer.get(url.clone()).headers(headers.clone());
-        if let Some(token) = token {
-            request = request.header(AUTHORIZATION, token);
-        }
-        let response = request
+        let response = self
+            .transfer
+            .get(url.clone())
+            .headers(headers.clone())
             .send()
             .await
             .map_err(|error| Error::transport(url.path(), error))?;

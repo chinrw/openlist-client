@@ -90,9 +90,11 @@ pub struct Fake {
     pub vanish_after_first_page: Mutex<Option<String>>,
     /// After page 1 of this path is served, one more entry appears.
     pub grow_after_first_page: Mutex<Option<String>>,
-    /// Whether each `/d` and `/raw` request carried an Authorization
-    /// header, in order.
+    /// Whether each `/hop`, `/d` and `/raw` request carried an
+    /// Authorization header, in order.
     pub auth_seen: Mutex<Vec<(String, bool)>>,
+    /// Whether each of those requests carried a Cookie header, in order.
+    pub cookie_seen: Mutex<Vec<(String, bool)>>,
     /// Delay before fs/remove answers.
     pub remove_delay: Mutex<Duration>,
     /// Delay before a provider host (`/raw`) answers.
@@ -165,6 +167,11 @@ impl Fake {
     }
 
     fn note_auth(&self, path: String, headers: &HeaderMap) {
+        let cookie = headers.contains_key(header::COOKIE);
+        self.cookie_seen
+            .lock()
+            .unwrap()
+            .push((path.clone(), cookie));
         let seen = headers.contains_key(header::AUTHORIZATION);
         self.auth_seen.lock().unwrap().push((path, seen));
     }
@@ -206,6 +213,7 @@ pub async fn start() -> Server {
         .route("/api/fs/remove", post(remove))
         .route("/files/{*path}", get(serve_file))
         .route("/d/{*path}", get(download))
+        .route("/hop/{*path}", get(hop))
         .route("/raw/{*path}", get(raw))
         .with_state(Arc::clone(&fake));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -445,6 +453,18 @@ async fn download(
         return StatusCode::NOT_FOUND.into_response();
     }
     let target = format!("{}/raw/{path}", fake.other_host());
+    (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+}
+
+/// An OpenList URL that redirects to another OpenList URL, as a `/d`
+/// behind a path rewrite would.
+async fn hop(
+    State(fake): State<Arc<Fake>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    fake.note_auth(format!("/hop/{path}"), &headers);
+    let target = format!("{}/d/{path}", fake.base());
     (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
 }
 

@@ -125,3 +125,48 @@ async fn a_non_http_url_is_rejected() {
     let url: Url = "ftp://example.test/a".parse().unwrap();
     assert!(client.open_url(&url, &HeaderMap::new()).await.is_err());
 }
+
+#[tokio::test]
+async fn caller_credentials_stop_where_the_request_leaves_openlist() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a.mp3", 1)]);
+    let client = server.client();
+    let url: Url = format!("{}/d/w/a.mp3", server.url).parse().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(reqwest::header::COOKIE, "session=1".parse().unwrap());
+    let transfer = client.open_url(&url, &headers).await.unwrap();
+    assert_eq!(transfer.status(), 200);
+    let seen = server.fake.cookie_seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            ("/d/w/a.mp3".to_owned(), true),
+            ("/raw/w/a.mp3".to_owned(), false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn every_openlist_hop_is_admitted_and_observed() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a.mp3", 1)]);
+    server.fake.fault("d", "/w/a.mp3", Fault::Status(502, None));
+    let client = server.client();
+    let url: Url = format!("{}/hop/w/a.mp3", server.url).parse().unwrap();
+
+    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
+    assert_eq!(transfer.status(), 502);
+    assert_eq!(
+        client.limits().link_rate,
+        500.0,
+        "the second OpenList hop's 502 counts"
+    );
+    let seen = server.fake.auth_seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            ("/hop/w/a.mp3".to_owned(), true),
+            ("/d/w/a.mp3".to_owned(), true)
+        ]
+    );
+}
