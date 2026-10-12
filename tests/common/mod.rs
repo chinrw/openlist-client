@@ -34,6 +34,8 @@ pub enum Fault {
     Code(i64, &'static str),
     /// This HTTP status, with an optional `Retry-After`.
     Status(u16, Option<&'static str>),
+    /// This HTTP status with this body.
+    StatusBody(u16, &'static str),
 }
 
 #[derive(Clone)]
@@ -240,6 +242,9 @@ fn code(code: i64, message: &str) -> Response {
 fn fault_response(fault: Fault) -> Response {
     match fault {
         Fault::Code(c, message) => code(c, message),
+        Fault::StatusBody(status, body) => {
+            (StatusCode::from_u16(status).unwrap(), body).into_response()
+        }
         Fault::Status(status, retry_after) => {
             let mut response = (StatusCode::from_u16(status).unwrap(), "fault").into_response();
             if let Some(value) = retry_after {

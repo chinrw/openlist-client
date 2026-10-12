@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Fault, file, start};
-use openlist_client::Client;
+use openlist_client::{Client, Error};
 use reqwest::header::HeaderMap;
 use url::Url;
 
@@ -98,8 +98,11 @@ async fn a_failing_d_link_slows_link_requests_down() {
     let client = server.client();
     let url: Url = format!("{}/d/w/a.mp3", server.url).parse().unwrap();
 
-    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
-    assert_eq!(transfer.status(), 502, "the caller decides about retries");
+    let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
+    assert!(
+        matches!(error, Error::Http { status: 502, .. }),
+        "{error:?}"
+    );
     assert_eq!(client.limits().link_rate, 500.0);
     assert_eq!(server.fake.hits("d", "/w/a.mp3"), 1);
 }
@@ -154,8 +157,11 @@ async fn every_openlist_hop_is_admitted_and_observed() {
     let client = server.client();
     let url: Url = format!("{}/hop/w/a.mp3", server.url).parse().unwrap();
 
-    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
-    assert_eq!(transfer.status(), 502);
+    let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
+    assert!(
+        matches!(error, Error::Http { status: 502, .. }),
+        "{error:?}"
+    );
     assert_eq!(
         client.limits().link_rate,
         500.0,
@@ -179,8 +185,11 @@ async fn a_return_to_openlist_is_admitted_but_unauthorized() {
     let client = server.client();
     let url: Url = format!("{}/back/w/a.mp3", server.url).parse().unwrap();
 
-    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
-    assert_eq!(transfer.status(), 502);
+    let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
+    assert!(
+        matches!(error, Error::Http { status: 502, .. }),
+        "{error:?}"
+    );
     assert_eq!(client.limits().link_rate, 500.0);
     let seen = server.fake.auth_seen.lock().unwrap().clone();
     assert_eq!(
@@ -240,4 +249,44 @@ async fn a_body_cut_short_is_a_retryable_transport_error() {
         ),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn a_missing_or_blocked_file_does_not_slow_links_down() {
+    let server = start().await;
+    server
+        .fake
+        .put("/w", vec![file("a.nfo", 1), file("b.nfo", 1)]);
+    let body = "failed link: failed get link: object not found";
+    server
+        .fake
+        .fault("d", "/w/a.nfo", Fault::StatusBody(500, body));
+    server
+        .fake
+        .fault("d", "/w/b.nfo", Fault::StatusBody(500, "违规内容"));
+    let client = server.client();
+    for name in ["a.nfo", "b.nfo"] {
+        let url: Url = format!("{}/d/w/{name}", server.url).parse().unwrap();
+        let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
+        assert!(
+            matches!(&error, Error::Http { status: 500, .. }),
+            "{error:?}"
+        );
+    }
+    assert_eq!(client.limits().link_rate, 1000.0);
+}
+
+#[tokio::test]
+async fn a_pause_beyond_the_budget_fails_the_request_that_received_it() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a.nfo", 1)]);
+    server
+        .fake
+        .fault("d", "/w/a.nfo", Fault::Status(503, Some("301")));
+    let mut config = server.config();
+    config.cooldown_budget = Duration::from_secs(300);
+    let client = Client::new(config).unwrap();
+    let url: Url = format!("{}/d/w/a.nfo", server.url).parse().unwrap();
+    let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
+    assert!(matches!(error, Error::RateLimited), "{error:?}");
 }

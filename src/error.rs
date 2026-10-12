@@ -137,6 +137,7 @@ impl Error {
                 // 501 and 505 report a missing capability, not a passing fault.
                 matches!(status, 408 | 429 | 500 | 502..=504 | 506..=599)
                     && !has_marker(body, PERMANENT_MARKERS)
+                    && !body.contains(NOT_FOUND_MARKER)
             }
             Self::Transport { retryable, .. } => *retryable,
             _ => false,
@@ -269,6 +270,7 @@ mod tests {
         for status in [301, 400, 403, 404, 501, 505] {
             assert!(!http(status, "").is_retryable(), "{status}");
         }
+        assert!(!http(500, "failed link: object not found").is_retryable());
     }
 
     #[test]

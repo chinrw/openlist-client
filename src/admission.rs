@@ -26,6 +26,11 @@ impl WaitBudget {
     pub(crate) fn new(total: Duration) -> Self {
         Self { remaining: total }
     }
+
+    /// Whether a pause of `wait` still fits.
+    pub(crate) fn covers(&self, wait: Duration) -> bool {
+        wait <= self.remaining
+    }
 }
 
 pub(crate) struct Admission {
@@ -113,7 +118,7 @@ impl Admission {
         pacer.lock().expect("pacer mutex poisoned")
     }
 
-    fn cooldown_left(&self) -> Duration {
+    pub(crate) fn cooldown_left(&self) -> Duration {
         let until = *self.cooldown_until.lock().expect("cooldown mutex poisoned");
         until.saturating_duration_since(Instant::now())
     }

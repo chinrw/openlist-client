@@ -438,13 +438,14 @@ impl Client {
     /// same rule, and the token is dropped once the chain leaves OpenList.
     /// Any other URL is a plain transfer, limited only by `max_transfers`.
     ///
-    /// Nothing is retried. The caller reads the status, including a 403
-    /// from an expired link.
+    /// Nothing is retried. The caller reads the provider's status, including
+    /// a 403 from an expired link.
     ///
     /// # Errors
-    /// [`Error::RateLimited`] when a pause outlasts the wait budget,
-    /// [`Error::InvalidPath`] for a URL that is not http(s), and connection
-    /// failures.
+    /// [`Error::Http`] when OpenList itself answers with an error status,
+    /// [`Error::RateLimited`] when a pause outlasts the wait budget, also one
+    /// the final response asks for, [`Error::InvalidPath`] for a URL that is
+    /// not http(s), and connection failures.
     pub async fn open_url(&self, url: &Url, headers: &HeaderMap) -> Result<Transfer, Error> {
         self.inner.open_url(url, headers).await
     }
@@ -489,6 +490,19 @@ fn redirect_target(response: &reqwest::Response) -> Option<Url> {
     let location = response.headers().get(LOCATION)?.to_str().ok()?;
     let next = response.url().join(location).ok()?;
     matches!(next.scheme(), "http" | "https").then_some(next)
+}
+
+/// The start of a failed response's body, kept for logs and classification.
+async fn error_prefix(response: &mut reqwest::Response) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    while prefix.len() < ERROR_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => prefix.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    prefix.truncate(ERROR_BODY_LIMIT);
+    prefix
 }
 
 fn link_rejected(status: StatusCode) -> bool {
@@ -691,10 +705,25 @@ impl Inner {
                 .await
                 .map_err(|error| Error::transport(url.path(), error))?;
             drop(api_permit);
+            let pause_left = match (self.requested_pause(&response), openlist) {
+                (Some(delay), true) => {
+                    self.admission.extend_cooldown(delay);
+                    self.admission.cooldown_left()
+                }
+                (Some(delay), false) => {
+                    self.admission.extend_transfer_cooldown(delay);
+                    self.admission.transfer_cooldown_left()
+                }
+                (None, _) => Duration::ZERO,
+            };
+            // The caller would only learn about such a pause from its next
+            // request, which may never come, as after a last retry.
+            if !budget.covers(pause_left) {
+                return Err(Error::RateLimited);
+            }
+            let mut response = response;
             if openlist {
-                self.observe_openlist_answer(&response);
-            } else if let Some(delay) = self.requested_pause(&response) {
-                self.admission.extend_transfer_cooldown(delay);
+                self.observe_openlist_answer(&url, &mut response).await?;
             }
             match redirect_target(&response) {
                 Some(next) => url = next,
@@ -718,20 +747,28 @@ impl Inner {
         }
     }
 
-    /// Feeds OpenList's first answer back into the link budget and the
-    /// client-wide pause.
-    fn observe_openlist_answer(&self, response: &reqwest::Response) {
-        if let Some(delay) = self.requested_pause(response) {
-            self.admission.extend_cooldown(delay);
-        }
+    /// Feeds an OpenList answer back into the link budget. An error status
+    /// becomes [`Error::Http`] with the start of the body, which tells a
+    /// missing or blocked file apart from throttling, as for `fs/link`.
+    async fn observe_openlist_answer(
+        &self,
+        url: &Url,
+        response: &mut reqwest::Response,
+    ) -> Result<(), Error> {
         let status = response.status();
         if status.is_success() || status.is_redirection() {
             self.admission.on_success(RequestClass::Link);
-        } else if matches!(status.as_u16(), 500 | 502..=504 | 506..=599) {
-            // As for fs/link, OpenList may relay 115's throttling as a bare
-            // 5xx.
+            return Ok(());
+        }
+        let error = Error::Http {
+            status: status.as_u16(),
+            path: url.path().to_owned(),
+            body: clean_body(&error_prefix(response).await),
+        };
+        if error.signals_throttle(RequestClass::Link) {
             self.admission.on_throttle(RequestClass::Link);
         }
+        Err(error)
     }
 
     /// Whether `url` is below OpenList's base URL. The path matters too,
@@ -903,18 +940,10 @@ impl Inner {
             self.admission.extend_cooldown(delay);
         }
         if !status.is_success() {
-            let mut prefix = Vec::new();
-            while prefix.len() < ERROR_BODY_LIMIT {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => prefix.extend_from_slice(&chunk),
-                    _ => break,
-                }
-            }
-            prefix.truncate(ERROR_BODY_LIMIT);
             return Err(Error::Http {
                 status: status.as_u16(),
                 path: path.to_owned(),
-                body: clean_body(&prefix),
+                body: clean_body(&error_prefix(&mut response).await),
             });
         }
         // A misbehaving server or proxy must not be able to exhaust memory
