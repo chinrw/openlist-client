@@ -188,6 +188,17 @@ mod tests {
     }
 
     #[test]
+    fn an_infinite_rate_never_waits_even_when_throttled() {
+        let mut pacer = Pacer::new(f64::INFINITY);
+        let start = Instant::now();
+        for _ in 0..3 {
+            pacer.on_throttle(start);
+            assert_eq!(pacer.reserve(start), Ok(()));
+        }
+        assert_eq!(pacer.rate(), f64::INFINITY);
+    }
+
+    #[test]
     fn a_rate_below_the_floor_is_never_raised_by_throttling() {
         let mut pacer = Pacer::new(0.05);
         pacer.on_throttle(Instant::now());

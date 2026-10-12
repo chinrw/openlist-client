@@ -188,9 +188,10 @@ fn has_marker(text: &str, markers: &[&str]) -> bool {
 /// Keeps a bounded, single-line copy of an error body for logs.
 pub(crate) fn clean_body(bytes: &[u8]) -> String {
     const MAX_CHARS: usize = 1024;
+    let text = String::from_utf8_lossy(bytes);
     let mut out = String::new();
     let mut last_space = true;
-    for ch in String::from_utf8_lossy(bytes).chars().take(MAX_CHARS) {
+    for ch in text.chars().take(MAX_CHARS) {
         // Control characters could inject terminal escapes into logs.
         if ch.is_whitespace() || ch.is_control() {
             if !last_space {
@@ -205,7 +206,8 @@ pub(crate) fn clean_body(bytes: &[u8]) -> String {
     out.truncate(out.trim_end().len());
     // Error pages and driver messages sometimes quote a signed link, and
     // these strings end up in Debug output and logs.
-    out.split(' ')
+    let mut out = out
+        .split(' ')
         .map(|word| {
             if word.contains("http://") || word.contains("https://") {
                 "<url>"
@@ -214,7 +216,20 @@ pub(crate) fn clean_body(bytes: &[u8]) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    // Retries and throttling are decided on this text, so a marker past the
+    // cut is kept.
+    let markers = THROTTLE_MARKERS
+        .iter()
+        .chain(PERMANENT_MARKERS)
+        .chain([&NOT_FOUND_MARKER]);
+    for marker in markers {
+        if text.contains(marker) && !out.contains(marker) {
+            out.push_str(" ... ");
+            out.push_str(marker);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -304,6 +319,10 @@ mod tests {
     fn clean_body_collapses_whitespace_and_controls() {
         assert_eq!(clean_body(b"  a \n\t b\x1b[2K  "), "a b [2K");
         assert_eq!(clean_body(&[b'x'; 5000]).len(), 1024);
+        let mut page = vec![b'x'; 5000];
+        page.extend_from_slice(b" failed link: object not found");
+        assert!(clean_body(&page).ends_with("... object not found"));
+        assert!(!http(500, &clean_body(&page)).is_retryable());
         assert_eq!(
             clean_body(b"failed: https://cdn.example/f?sig=secret gone"),
             "failed: <url> gone"

@@ -22,10 +22,11 @@ pub struct Config {
     /// Listings in flight at once. Halved while the provider throttles.
     pub list_concurrency: usize,
     /// `fs/link` and `fs/get` requests per second. Halved while the provider
-    /// throttles.
+    /// throttles. `f64::INFINITY` turns pacing off, and throttling then
+    /// leaves it off.
     pub link_rate: f64,
     /// `fs/remove` requests per second, on a budget separate from links.
-    /// Halved while the provider throttles.
+    /// Halved while the provider throttles. `f64::INFINITY` turns it off.
     pub mutate_rate: f64,
     /// API requests in flight at once across all classes.
     pub max_api_requests: usize,
@@ -151,7 +152,8 @@ impl Config {
             Auth::Token(token) if token.is_empty() => return fail("token is empty"),
             _ => {}
         }
-        let usable = |rate: f64| rate.is_finite() && rate >= MIN_RATE;
+        // NaN fails the comparison. Infinity is allowed and means no pacing.
+        let usable = |rate: f64| rate >= MIN_RATE;
         if !usable(self.link_rate) || !usable(self.mutate_rate) {
             return fail("link_rate and mutate_rate must be at least 0.001 per second");
         }
@@ -228,6 +230,13 @@ mod tests {
         let mut bad = config();
         bad.link_rate = 1e-20;
         assert!(bad.check().is_err());
+        let mut bad = config();
+        bad.link_rate = f64::NAN;
+        assert!(bad.check().is_err());
+        let mut unpaced = config();
+        unpaced.link_rate = f64::INFINITY;
+        unpaced.mutate_rate = f64::INFINITY;
+        assert!(unpaced.check().is_ok());
         let mut bad = config();
         bad.auth = Auth::Token(String::new());
         assert!(bad.check().is_err());

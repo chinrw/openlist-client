@@ -429,3 +429,20 @@ async fn a_login_lockout_pauses_the_client_instead_of_retrying() {
     assert!(matches!(error, Error::RateLimited), "{error:?}");
     assert_eq!(server.fake.hits("login", "/"), 1, "no login while paused");
 }
+
+#[tokio::test]
+async fn a_pause_beyond_the_budget_on_the_last_attempt_is_rate_limited() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a", 1)]);
+    for fault in [
+        Fault::Status(500, None),
+        Fault::Status(500, None),
+        Fault::Status(503, Some("301")),
+    ] {
+        server.fake.fault("list", "/w", fault);
+    }
+    let client = server.client();
+    let error = client.list("/w").await.unwrap_err();
+    assert!(matches!(error, Error::RateLimited), "{error:?}");
+    assert_eq!(server.fake.hits("list", "/w"), 3);
+}

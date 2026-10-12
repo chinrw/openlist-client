@@ -38,8 +38,9 @@ const ENVELOPE_429_PAUSE: Duration = Duration::from_secs(60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// Redirects followed below OpenList before giving up, as reqwest's default.
 const MAX_REDIRECTS: usize = 10;
-/// Bytes of a failed response kept for logs.
-const ERROR_BODY_LIMIT: usize = 4096;
+/// Bytes of a failed response read for classification. Error pages can be
+/// long HTML whose only signal comes late.
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
 
 /// An OpenList client. Clones share one connection pool, one set of rate
 /// limits and one set of caches, so create one per OpenList server.
@@ -846,6 +847,11 @@ impl Inner {
                 continue;
             }
             if !error.is_retryable() || attempt >= attempts {
+                // A 429 or 503 on the last attempt may ask for a pause no
+                // later request of this call would notice.
+                if !budget.covers(self.admission.cooldown_left()) {
+                    return Err(Error::RateLimited);
+                }
                 return Err(error);
             }
             debug!(path = spec.path, endpoint = spec.endpoint, attempt, %error, "retrying");
