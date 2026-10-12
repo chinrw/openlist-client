@@ -51,6 +51,13 @@ whose base path is `/`. `Client::open_url` opens a `raw_url` from `Client::get`
 or an OpenList `/d` link and works with any account. It sends the token only to
 URLs below the configured base URL.
 
+File transfers never connect to a loopback or link-local address, such as
+`127.0.0.1` or `169.254.169.254`, unless it is OpenList's own address and port.
+Links come from OpenList, so this keeps a hostile OpenList from pointing the
+client at services on its own machine. Private LAN addresses are allowed. Set
+`Config::local_links` if a provider really runs on the same machine under
+another name.
+
 `Client::remove` deletes entries with `fs/remove`. It is paced on its own
 budget (`mutate_rate`) and never retried, because a timeout leaves the outcome
 unknown.

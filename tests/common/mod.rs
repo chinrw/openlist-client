@@ -103,6 +103,8 @@ pub struct Fake {
     pub remove_delay: Mutex<Duration>,
     /// Delay before a provider host (`/raw`) answers.
     pub raw_delay: Mutex<Duration>,
+    /// The base of the URLs fs/link hands out, instead of this server's.
+    pub link_base: Mutex<Option<String>>,
     addr: Mutex<Option<SocketAddr>>,
 }
 
@@ -197,6 +199,8 @@ impl Server {
         let mut config = Config::new(self.url.parse().unwrap(), USER, PASSWORD);
         config.retry_delay = Duration::from_millis(1);
         config.link_rate = 1000.0;
+        // Provider hosts are other names for this loopback server.
+        config.local_links = true;
         config
     }
 
@@ -205,6 +209,8 @@ impl Server {
         let mut config = Config::with_token(self.url.parse().unwrap(), token);
         config.retry_delay = Duration::from_millis(1);
         config.link_rate = 1000.0;
+        // Provider hosts are other names for this loopback server.
+        config.local_links = true;
         config
     }
 
@@ -213,6 +219,8 @@ impl Server {
         let mut config = Config::anonymous(self.url.parse().unwrap());
         config.retry_delay = Duration::from_millis(1);
         config.link_rate = 1000.0;
+        // Provider hosts are other names for this loopback server.
+        config.local_links = true;
         config
     }
 
@@ -236,6 +244,7 @@ pub async fn start() -> Server {
         .route("/bounce/{*path}", get(bounce))
         .route("/not-modified/{*path}", get(not_modified))
         .route("/raw/{*path}", get(raw))
+        .route("/away/{*path}", get(away))
         .with_state(Arc::clone(&fake));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -382,8 +391,14 @@ async fn link(
     }
     let serial = fake.link_serial.fetch_add(1, Ordering::SeqCst) + 1;
     let expiration = *fake.link_expiration.lock().unwrap();
+    let base = fake
+        .link_base
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| fake.base());
     ok(json!({
-        "url": format!("{}/files{path}?serial={serial}", fake.base()),
+        "url": format!("{base}/files{path}?serial={serial}"),
         "header": {"User-Agent": [LINK_UA]},
         "Expiration": expiration,
         "concurrency": 0, "part_size": 0, "content_length": 0,
@@ -512,6 +527,14 @@ async fn bounce(
     fake.note_auth(format!("/bounce/{path}"), &headers);
     let target = format!("{}/d/{path}", fake.base());
     (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]).into_response()
+}
+
+/// Sends the client to this server under its IPv6 loopback address, a
+/// local host that is not OpenList's.
+async fn away(State(fake): State<Arc<Fake>>, Path(path): Path<String>) -> Response {
+    let port = fake.addr.lock().unwrap().unwrap().port();
+    let target = format!("http://[::1]:{port}/files/{path}");
+    (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
 }
 
 /// A 304 that carries a Location, which must not be followed.

@@ -23,6 +23,7 @@ use crate::{
     admission::{Admission, Limits, Permit, WaitBudget, retry_after},
     cache::Cache,
     error::{NOT_FOUND_MARKER, clean_body},
+    guard::Guard,
     limit::RequestClass,
     path,
     types::{
@@ -58,6 +59,8 @@ struct Inner {
     /// Like `transfer`, but returns redirects, so `open_url` can admit each
     /// hop to OpenList and give its API slot back before the next one.
     first_hop: reqwest::Client,
+    /// Refuses transfers to local IP literals that are not OpenList's.
+    guard: Guard,
     admission: Arc<Admission>,
     transfers: Arc<Semaphore>,
     token: Mutex<TokenState>,
@@ -106,17 +109,31 @@ impl Client {
             .map_err(build_error)?;
         // Transfers have no total timeout because a player reads at its own
         // pace. A stalled read still fails after `request_timeout`.
+        let guard = Guard::new(&config.url, config.local_links);
         let transfer_client = |redirect| {
-            reqwest::Client::builder()
+            let builder = reqwest::Client::builder()
                 .user_agent(&config.user_agent)
                 .redirect(redirect)
                 .no_proxy()
                 .connect_timeout(config.request_timeout)
-                .read_timeout(config.request_timeout)
-                .build()
-                .map_err(build_error)
+                .read_timeout(config.request_timeout);
+            match guard.resolver() {
+                Some(resolver) => builder.dns_resolver(Arc::new(resolver)),
+                None => builder,
+            }
+            .build()
+            .map_err(build_error)
         };
-        let transfer = transfer_client(reqwest::redirect::Policy::limited(10))?;
+        let hops = guard.clone();
+        let transfer = transfer_client(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if hops.allows(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("a redirect points at a local address")
+            }
+        }))?;
         let first_hop = transfer_client(reqwest::redirect::Policy::none())?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -141,6 +158,7 @@ impl Client {
                 api,
                 transfer,
                 first_hop,
+                guard,
                 config,
             }),
         })
@@ -506,6 +524,10 @@ async fn error_prefix(response: &mut reqwest::Response) -> Vec<u8> {
     prefix
 }
 
+fn local_target(path: &str) -> Error {
+    Error::protocol(path, "the link points at a local address")
+}
+
 fn link_rejected(status: StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 403 | 404)
 }
@@ -629,6 +651,9 @@ impl Inner {
         link: &Link,
         headers: &HeaderMap,
     ) -> Result<Transfer, Error> {
+        if !self.guard.allows(&link.url) {
+            return Err(local_target(path));
+        }
         let mut budget = WaitBudget::new(self.config.cooldown_budget);
         let permit = self.transfer_slot(&mut budget).await?;
         let mut merged = headers.clone();
@@ -675,6 +700,9 @@ impl Inner {
         let mut authorized = true;
         let mut credentials = true;
         for _ in 0..=MAX_REDIRECTS {
+            if !self.guard.allows(&url) {
+                return Err(local_target(url.path()));
+            }
             let openlist = self.is_openlist(&url);
             authorized &= openlist;
             credentials &= url.origin() == first_origin;
