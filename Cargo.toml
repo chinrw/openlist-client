@@ -2,6 +2,7 @@
 name = "openlist-client"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "OpenList API client with per-class rate limits and in-memory caches"
 repository = "https://github.com/chinrw/openlist-client"
