@@ -69,6 +69,28 @@ async fn a_provider_url_is_neither_paced_nor_authorized() {
 }
 
 #[tokio::test]
+async fn a_slow_provider_does_not_hold_the_api_slot() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a.mp3", 1)]);
+    let mut config = server.config();
+    config.max_api_requests = 1;
+    let client = Client::new(config).unwrap();
+    client.list("/w").await.unwrap();
+    *server.fake.raw_delay.lock().unwrap() = Duration::from_secs(3);
+
+    let download = {
+        let client = client.clone();
+        let url: Url = format!("{}/d/w/a.mp3", server.url).parse().unwrap();
+        tokio::spawn(async move { client.open_url(&url, &HeaderMap::new()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client.invalidate_listing("/w");
+    let listing = tokio::time::timeout(Duration::from_secs(1), client.list("/w")).await;
+    assert!(listing.expect("the API slot was released").is_ok());
+    download.abort();
+}
+
+#[tokio::test]
 async fn a_failing_d_link_slows_link_requests_down() {
     let server = start().await;
     server.fake.put("/w", vec![file("a.mp3", 1)]);
@@ -80,6 +102,20 @@ async fn a_failing_d_link_slows_link_requests_down() {
     assert_eq!(transfer.status(), 502, "the caller decides about retries");
     assert_eq!(client.limits().link_rate, 500.0);
     assert_eq!(server.fake.hits("d", "/w/a.mp3"), 1);
+}
+
+#[tokio::test]
+async fn the_token_stays_below_the_base_path() {
+    let server = start().await;
+    let mut config = server.token_config("settings-token");
+    // OpenList behind a reverse proxy at /openlist, next to another app.
+    config.url = format!("{}/openlist", server.url).parse().unwrap();
+    let client = Client::new(config).unwrap();
+    let url: Url = format!("{}/raw/w/a.mp3", server.url).parse().unwrap();
+    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
+    assert_eq!(transfer.status(), 200);
+    let seen = server.fake.auth_seen.lock().unwrap().clone();
+    assert_eq!(seen, [("/raw/w/a.mp3".to_owned(), false)]);
 }
 
 #[tokio::test]

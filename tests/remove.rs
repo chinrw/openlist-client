@@ -1,5 +1,7 @@
 mod common;
 
+use std::time::Duration;
+
 use common::{Fault, dir, file, start};
 use openlist_client::{Error, ErrorKind};
 
@@ -53,6 +55,26 @@ async fn a_failed_removal_is_sent_once_and_still_drops_the_cache() {
         1,
         "removals are never retried"
     );
+
+    client.list("/w").await.unwrap();
+    assert_eq!(server.fake.hits("list", "/w"), 2);
+}
+
+#[tokio::test]
+async fn a_cancelled_removal_still_drops_the_cache() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a", 1)]);
+    let client = server.client();
+    client.list("/w").await.unwrap();
+    *server.fake.remove_delay.lock().unwrap() = Duration::from_millis(300);
+
+    let removal = {
+        let client = client.clone();
+        tokio::spawn(async move { client.remove("/w", &names(&["a"])).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    removal.abort();
+    let _ = removal.await;
 
     client.list("/w").await.unwrap();
     assert_eq!(server.fake.hits("list", "/w"), 2);

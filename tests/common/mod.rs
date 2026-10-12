@@ -93,6 +93,10 @@ pub struct Fake {
     /// Whether each `/d` and `/raw` request carried an Authorization
     /// header, in order.
     pub auth_seen: Mutex<Vec<(String, bool)>>,
+    /// Delay before fs/remove answers.
+    pub remove_delay: Mutex<Duration>,
+    /// Delay before a provider host (`/raw`) answers.
+    pub raw_delay: Mutex<Duration>,
     addr: Mutex<Option<SocketAddr>>,
 }
 
@@ -405,6 +409,8 @@ async fn remove(
     Json(body): Json<Value>,
 ) -> Response {
     let dir = body["dir"].as_str().unwrap_or_default().to_owned();
+    let delay = *fake.remove_delay.lock().unwrap();
+    tokio::time::sleep(delay).await;
     if let Some(fault) = fake.take_fault("remove", &dir) {
         return fault_response(fault);
     }
@@ -449,6 +455,8 @@ async fn raw(
     headers: HeaderMap,
 ) -> Response {
     fake.note_auth(format!("/raw/{path}"), &headers);
+    let delay = *fake.raw_delay.lock().unwrap();
+    tokio::time::sleep(delay).await;
     format!("contents of /{path}").into_response()
 }
 

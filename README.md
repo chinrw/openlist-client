@@ -45,7 +45,13 @@ admin token on OpenList's settings page, and never logs in. If OpenList rejects
 that token, the call fails with `Error::Login`.
 
 `Client::link` and `Client::open` call `fs/link`, which needs an admin account
-whose base path is `/`.
+whose base path is `/`. `Client::open_url` opens a `raw_url` from `Client::get`
+or an OpenList `/d` link and works with any account. It sends the token only to
+URLs below the configured base URL.
+
+`Client::remove` deletes entries with `fs/remove`. It is paced on its own
+budget (`mutate_rate`) and never retried, because a timeout leaves the outcome
+unknown.
 
 ## Development
 

@@ -203,18 +203,22 @@ impl Admission {
         wait_out(budget, &self.cooldown_changed, || self.cooldown_left()).await
     }
 
+    /// Time left in a pause a provider host started.
+    pub(crate) fn transfer_cooldown_left(&self) -> Duration {
+        let until = *self
+            .transfer_cooldown_until
+            .lock()
+            .expect("cooldown mutex poisoned");
+        until.saturating_duration_since(Instant::now())
+    }
+
     /// Waits out both the client-wide pause and the transfer pause.
     pub(crate) async fn wait_transfer_cooldown(
         &self,
         budget: &mut WaitBudget,
     ) -> Result<(), Error> {
         wait_out(budget, &self.cooldown_changed, || {
-            let until = *self
-                .transfer_cooldown_until
-                .lock()
-                .expect("cooldown mutex poisoned");
-            self.cooldown_left()
-                .max(until.saturating_duration_since(Instant::now()))
+            self.cooldown_left().max(self.transfer_cooldown_left())
         })
         .await
     }

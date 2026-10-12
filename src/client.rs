@@ -9,7 +9,7 @@ use std::{
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::{
     StatusCode,
-    header::{AUTHORIZATION, HeaderMap, RETRY_AFTER},
+    header::{AUTHORIZATION, HeaderMap, LOCATION, RETRY_AFTER},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -50,6 +50,9 @@ struct Inner {
     base: Url,
     api: reqwest::Client,
     transfer: reqwest::Client,
+    /// Like `transfer`, but returns redirects, so a request to OpenList can
+    /// give back its API slot before the provider answers.
+    first_hop: reqwest::Client,
     admission: Arc<Admission>,
     transfers: Arc<Semaphore>,
     token: Mutex<TokenState>,
@@ -98,14 +101,18 @@ impl Client {
             .map_err(build_error)?;
         // Transfers have no total timeout because a player reads at its own
         // pace. A stalled read still fails after `request_timeout`.
-        let transfer = reqwest::Client::builder()
-            .user_agent(&config.user_agent)
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .no_proxy()
-            .connect_timeout(config.request_timeout)
-            .read_timeout(config.request_timeout)
-            .build()
-            .map_err(build_error)?;
+        let transfer_client = |redirect| {
+            reqwest::Client::builder()
+                .user_agent(&config.user_agent)
+                .redirect(redirect)
+                .no_proxy()
+                .connect_timeout(config.request_timeout)
+                .read_timeout(config.request_timeout)
+                .build()
+                .map_err(build_error)
+        };
+        let transfer = transfer_client(reqwest::redirect::Policy::limited(10))?;
+        let first_hop = transfer_client(reqwest::redirect::Policy::none())?;
         Ok(Self {
             inner: Arc::new(Inner {
                 admission: Arc::new(Admission::new(
@@ -128,6 +135,7 @@ impl Client {
                 base,
                 api,
                 transfer,
+                first_hop,
                 config,
             }),
         })
@@ -304,17 +312,17 @@ impl Client {
             .inner
             .spec(RequestClass::Mutate, "api/fs/remove", &dir, false);
         let body = RemoveRequest { dir: &dir, names };
-        let result = self
-            .inner
+        // Runs on drop, so a caller that times out or cancels after the
+        // request reached OpenList cannot leave deleted entries cached.
+        let _invalidate = InvalidateOnDrop {
+            inner: &self.inner,
+            dir: &dir,
+            targets: &targets,
+        };
+        self.inner
             .call::<_, serde::de::IgnoredAny>(&spec, &body)
             .await
-            .map(drop);
-        self.inner.listings.invalidate(&dir);
-        for target in &targets {
-            self.inner.listings.invalidate_tree(target);
-            self.inner.links.invalidate_tree(target);
-        }
-        result
+            .map(drop)
     }
 
     /// Forgets a cached link, for example after the provider rejected it.
@@ -447,6 +455,34 @@ impl std::fmt::Debug for Client {
 
 fn too_large(path: &str, limit: usize) -> Error {
     Error::protocol(path, format!("response is larger than {limit} bytes"))
+}
+
+/// Drops the caches a removal may have made stale.
+struct InvalidateOnDrop<'a> {
+    inner: &'a Inner,
+    dir: &'a str,
+    targets: &'a [String],
+}
+
+impl Drop for InvalidateOnDrop<'_> {
+    fn drop(&mut self) {
+        self.inner.listings.invalidate(self.dir);
+        for target in self.targets {
+            self.inner.listings.invalidate_tree(target);
+            self.inner.links.invalidate_tree(target);
+        }
+    }
+}
+
+/// The absolute target of a redirect response, if it is one with a usable
+/// `Location`.
+fn redirect_target(response: &reqwest::Response) -> Option<Url> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let location = response.headers().get(LOCATION)?.to_str().ok()?;
+    let next = response.url().join(location).ok()?;
+    matches!(next.scheme(), "http" | "https").then_some(next)
 }
 
 fn link_rejected(status: StatusCode) -> bool {
@@ -602,52 +638,98 @@ impl Inner {
                 path: url.path().to_owned(),
             });
         }
-        let label = url.path();
-        let on_server = url.origin() == self.base.origin();
         let mut budget = WaitBudget::new(self.config.cooldown_budget);
         // The transfer slot comes first, so a request waiting for one does
         // not hold an API slot that listings need.
         let permit = self.transfer_slot(&mut budget).await?;
-        let mut request = self.transfer.get(url.clone()).headers(headers.clone());
-        let api_permit = if on_server {
-            let (token, _) = self.token(&mut budget).await?;
-            // reqwest drops Authorization when a redirect leaves this host,
-            // so the provider host never sees the token.
-            request = request.header(AUTHORIZATION, token);
-            Some(
-                self.admission
-                    .acquire(RequestClass::Link, &mut budget)
-                    .await?,
-            )
-        } else {
-            None
+        if !self.is_openlist(url) {
+            let response = self.send_transfer(url, headers, None).await?;
+            return Ok(Transfer::new(response, permit));
+        }
+        let (token, _) = self.token(&mut budget).await?;
+        let api_permit = loop {
+            let api_permit = self
+                .admission
+                .acquire(RequestClass::Link, &mut budget)
+                .await?;
+            // A provider pause that began while this request waited for its
+            // turn still applies, but is waited out without the API slot.
+            if self.admission.transfer_cooldown_left().is_zero() {
+                break api_permit;
+            }
+            drop(api_permit);
+            self.admission.wait_transfer_cooldown(&mut budget).await?;
         };
+        let first = self
+            .first_hop
+            .get(url.clone())
+            .headers(headers.clone())
+            .header(AUTHORIZATION, &token)
+            .send()
+            .await
+            .map_err(|error| Error::transport(url.path(), error))?;
+        // OpenList has answered, so the provider call it made is over. A
+        // redirect target or the body may take minutes and must not hold an
+        // API slot.
+        drop(api_permit);
+        self.observe_openlist_answer(&first);
+        let Some(next) = redirect_target(&first) else {
+            return Ok(Transfer::new(first, permit));
+        };
+        drop(first);
+        // Only a hop that stays below OpenList keeps the token.
+        let token = self.is_openlist(&next).then_some(token.as_str());
+        let response = self.send_transfer(&next, headers, token).await?;
+        Ok(Transfer::new(response, permit))
+    }
+
+    /// Feeds OpenList's first answer back into the link budget and the
+    /// client-wide pause.
+    fn observe_openlist_answer(&self, response: &reqwest::Response) {
+        if let Some(delay) = self.requested_pause(response) {
+            self.admission.extend_cooldown(delay);
+        }
+        let status = response.status();
+        if status.is_success() || status.is_redirection() {
+            self.admission.on_success(RequestClass::Link);
+        } else if matches!(status.as_u16(), 500 | 502..=504 | 506..=599) {
+            // As for fs/link, OpenList may relay 115's throttling as a bare
+            // 5xx.
+            self.admission.on_throttle(RequestClass::Link);
+        }
+    }
+
+    /// Sends a GET that follows redirects. reqwest drops Authorization when a
+    /// redirect leaves the host, so the provider never sees the token.
+    async fn send_transfer(
+        &self,
+        url: &Url,
+        headers: &HeaderMap,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response, Error> {
+        let mut request = self.transfer.get(url.clone()).headers(headers.clone());
+        if let Some(token) = token {
+            request = request.header(AUTHORIZATION, token);
+        }
         let response = request
             .send()
             .await
-            .map_err(|error| Error::transport(label, error))?;
-        // OpenList has answered or redirected, so the provider call it made
-        // is over. The body may take minutes and must not hold an API slot.
-        drop(api_permit);
-        let answered_by_server = response.url().origin() == self.base.origin();
+            .map_err(|error| Error::transport(url.path(), error))?;
         if let Some(delay) = self.requested_pause(&response) {
-            if answered_by_server {
+            if self.is_openlist(response.url()) {
                 self.admission.extend_cooldown(delay);
             } else {
                 self.admission.extend_transfer_cooldown(delay);
             }
         }
-        if on_server {
-            let status = response.status();
-            if !answered_by_server || status.is_success() {
-                self.admission.on_success(RequestClass::Link);
-            } else if matches!(status.as_u16(), 500 | 502..=504 | 506..=599) {
-                // As for fs/link, OpenList may relay 115's throttling as a
-                // bare 5xx.
-                self.admission.on_throttle(RequestClass::Link);
-            }
-        }
-        Ok(Transfer::new(response, permit))
+        Ok(response)
+    }
+
+    /// Whether `url` is below OpenList's base URL. The path matters too,
+    /// because a reverse proxy may serve other applications on the same
+    /// origin, and those must not receive the token.
+    fn is_openlist(&self, url: &Url) -> bool {
+        url.origin() == self.base.origin() && url.path().starts_with(self.base.path())
     }
 
     /// Waits for a transfer slot. Transfers honour the client-wide pause
