@@ -105,6 +105,8 @@ pub struct Fake {
     pub raw_delay: Mutex<Duration>,
     /// The base of the URLs fs/link hands out, instead of this server's.
     pub link_base: Mutex<Option<String>>,
+    /// Where `/away` redirects to.
+    pub away_target: Mutex<String>,
     addr: Mutex<Option<SocketAddr>>,
 }
 
@@ -529,11 +531,9 @@ async fn bounce(
     (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]).into_response()
 }
 
-/// Sends the client to this server under its IPv6 loopback address, a
-/// local host that is not OpenList's.
+/// Redirects to `away_target`, followed by the path.
 async fn away(State(fake): State<Arc<Fake>>, Path(path): Path<String>) -> Response {
-    let port = fake.addr.lock().unwrap().unwrap().port();
-    let target = format!("http://[::1]:{port}/files/{path}");
+    let target = format!("{}/{path}", fake.away_target.lock().unwrap());
     (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
 }
 

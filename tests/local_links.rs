@@ -3,6 +3,11 @@
 
 mod common;
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use common::{file, start};
 use openlist_client::{Client, Error};
 use reqwest::header::HeaderMap;
@@ -58,15 +63,34 @@ async fn a_name_for_this_machine_is_refused() {
     assert_eq!(server.fake.hits("file", "/w/01.mp3"), 0);
 }
 
+/// Another service on this machine, which counts what reaches it.
+async fn local_service() -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&hits);
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { "secret" }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, hits)
+}
+
 #[tokio::test]
-async fn a_redirect_to_a_local_address_is_not_followed() {
+async fn a_redirect_to_another_local_service_is_not_followed() {
     let server = start().await;
     server.fake.put("/w", vec![file("01.mp3", 10)]);
-    // The link itself is on OpenList's host, and that host redirects.
+    let (service, hits) = local_service().await;
+    *server.fake.away_target.lock().unwrap() = service;
+    // The link is on OpenList's own origin, which then redirects.
     *server.fake.link_base.lock().unwrap() = Some(format!("{}/away", server.url));
     let client = guarded(&server);
-    let result = client.open("/w/01.mp3", &HeaderMap::new()).await;
-    assert!(result.is_err(), "the redirect was followed");
+    let error = client
+        .open("/w/01.mp3", &HeaderMap::new())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("local address"), "{error}");
 
     let url = format!("{}/away/w/01.mp3", server.url).parse().unwrap();
     let error = client.open_url(&url, &HeaderMap::new()).await;
@@ -75,4 +99,5 @@ async fn a_redirect_to_a_local_address_is_not_followed() {
         "{:?}",
         error.map(|t| t.status())
     );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
