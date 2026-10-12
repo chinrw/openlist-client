@@ -1,4 +1,5 @@
-//! Client settings. Defaults follow the OpenList chapter of the design book.
+//! Client settings. The defaults suit OpenList in front of 115, which
+//! throttles at roughly one provider call per second.
 
 use std::time::Duration;
 

@@ -1,27 +1,27 @@
 [package]
 name = "openlist-client"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
 description = "OpenList API client with per-class rate limits and in-memory caches"
+repository = "https://github.com/chinrw/openlist-client"
+publish = false
 
-# This crate will move to its own repository for alist_cli, so it must not
-# depend on any neo-* crate.
 [dependencies]
-bytes.workspace = true
-futures-util.workspace = true
-httpdate.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-time.workspace = true
-tokio = { workspace = true, features = ["sync"] }
-tracing.workspace = true
-url.workspace = true
+bytes = "1"
+futures-util = "0.3"
+httpdate = "1"
+# The ring backend of rustls builds without cmake, unlike aws-lc-rs.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["parsing"] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+tracing = "0.1"
+url = "2"
 
 [dev-dependencies]
-axum.workspace = true
-serde_json.workspace = true
-tokio = { workspace = true, features = ["sync", "test-util"] }
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }

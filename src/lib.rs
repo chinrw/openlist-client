@@ -34,9 +34,6 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! The crate does not depend on kikoeru-neo so that alist_cli can use it
-//! too.
 
 mod admission;
 mod cache;
