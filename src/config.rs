@@ -64,6 +64,11 @@ pub struct Config {
     /// fails at once with [`crate::Error::Busy`]: at `link_rate` a longer
     /// queue only makes every caller wait longer.
     pub max_pending_links: usize,
+    /// Whether transfers may reach loopback or link-local addresses on a
+    /// host other than OpenList's. Links come from OpenList, so with this
+    /// off a hostile one cannot point the client at services on this
+    /// machine. Private LAN addresses are always allowed. Off by default.
+    pub local_links: bool,
 }
 
 /// How the client authenticates to OpenList.
@@ -143,6 +148,7 @@ impl Config {
             link_ttl: Duration::from_secs(600),
             link_cache_capacity: 1024,
             max_pending_links: 32,
+            local_links: false,
         }
     }
 

@@ -40,6 +40,7 @@ mod cache;
 mod client;
 mod config;
 mod error;
+mod guard;
 mod limit;
 pub mod path;
 mod transfer;
