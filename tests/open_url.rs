@@ -170,3 +170,37 @@ async fn every_openlist_hop_is_admitted_and_observed() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_return_to_openlist_is_admitted_but_unauthorized() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a.mp3", 1)]);
+    server.fake.fault("d", "/w/a.mp3", Fault::Status(502, None));
+    let client = server.client();
+    let url: Url = format!("{}/back/w/a.mp3", server.url).parse().unwrap();
+
+    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
+    assert_eq!(transfer.status(), 502);
+    assert_eq!(client.limits().link_rate, 500.0);
+    let seen = server.fake.auth_seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            ("/back/w/a.mp3".to_owned(), true),
+            ("/bounce/w/a.mp3".to_owned(), false),
+            ("/d/w/a.mp3".to_owned(), false),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_304_is_returned_rather_than_followed() {
+    let server = start().await;
+    let client = server.client();
+    let url: Url = format!("{}/not-modified/w/a.mp3", server.url)
+        .parse()
+        .unwrap();
+    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
+    assert_eq!(transfer.status(), 304);
+    assert!(server.fake.auth_seen.lock().unwrap().is_empty());
+}

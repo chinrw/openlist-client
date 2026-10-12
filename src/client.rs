@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::{
     Auth, Config, ConfigError, Entry, Error, FileInfo, Link, Listing, Transfer, WalkEntry,
-    admission::{Admission, Limits, WaitBudget, retry_after},
+    admission::{Admission, Limits, Permit, WaitBudget, retry_after},
     cache::Cache,
     error::{NOT_FOUND_MARKER, clean_body},
     limit::RequestClass,
@@ -54,8 +54,8 @@ struct Inner {
     base: Url,
     api: reqwest::Client,
     transfer: reqwest::Client,
-    /// Like `transfer`, but returns redirects, so a request to OpenList can
-    /// give back its API slot before the provider answers.
+    /// Like `transfer`, but returns redirects, so `open_url` can admit each
+    /// hop to OpenList and give its API slot back before the next one.
     first_hop: reqwest::Client,
     admission: Arc<Admission>,
     transfers: Arc<Semaphore>,
@@ -432,10 +432,11 @@ impl Client {
     /// entry's `sign`, forwarding `headers` such as `Range`. Unlike
     /// [`Client::open`] it needs no admin account.
     ///
-    /// A URL on OpenList's own origin makes OpenList ask the provider for
+    /// A URL below OpenList's base URL makes OpenList ask the provider for
     /// the file, so it waits for the link budget like [`Client::link`] and
-    /// carries the token, which redirects to another host drop. Any other
-    /// URL is a plain transfer, limited only by `max_transfers`.
+    /// carries the token. Redirects are followed one hop at a time with the
+    /// same rule, and the token is dropped once the chain leaves OpenList.
+    /// Any other URL is a plain transfer, limited only by `max_transfers`.
     ///
     /// Nothing is retried. The caller reads the status, including a 403
     /// from an expired link.
@@ -481,7 +482,8 @@ impl Drop for InvalidateOnDrop<'_> {
 /// The absolute target of a redirect response, if it is one with a usable
 /// `Location`.
 fn redirect_target(response: &reqwest::Response) -> Option<Url> {
-    if !response.status().is_redirection() {
+    // As reqwest: 304 and 300 carry a Location without asking to follow it.
+    if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
         return None;
     }
     let location = response.headers().get(LOCATION)?.to_str().ok()?;
@@ -646,39 +648,41 @@ impl Inner {
         // The transfer slot comes first, so a request waiting for one does
         // not hold an API slot that listings need.
         let permit = self.transfer_slot(&mut budget).await?;
+        let first_origin = url.origin();
         let mut url = url.clone();
         let mut token = None;
-        let mut hops = 0;
-        // Every hop below OpenList makes it call the provider, so each one
-        // goes through link admission and gives its API slot back as soon as
-        // OpenList answers. reqwest follows only the hops after that.
-        while self.is_openlist(&url) {
-            if hops == MAX_REDIRECTS {
-                return Err(Error::protocol(url.path(), "too many redirects"));
-            }
-            hops += 1;
-            let token = match &token {
-                Some(token) => token,
-                None => &*token.insert(self.token(&mut budget).await?.0),
-            };
-            let api_permit = loop {
-                let api_permit = self
-                    .admission
-                    .acquire(RequestClass::Link, &mut budget)
-                    .await?;
-                // A provider pause that began while this request waited for
-                // its turn still applies, but is waited out without the API
-                // slot.
-                if self.admission.transfer_cooldown_left().is_zero() {
-                    break api_permit;
-                }
-                drop(api_permit);
-                self.admission.wait_transfer_cooldown(&mut budget).await?;
-            };
+        // Redirects are followed here rather than by reqwest, so every hop
+        // below OpenList goes through link admission and feedback and gives
+        // its API slot back as soon as OpenList answers. The rules for
+        // credentials match reqwest's: the token stops once the chain leaves
+        // OpenList, and the caller's credentials once it leaves the host it
+        // started on, even if a later hop returns.
+        let mut authorized = true;
+        let mut credentials = true;
+        for _ in 0..=MAX_REDIRECTS {
+            let openlist = self.is_openlist(&url);
+            authorized &= openlist;
+            credentials &= url.origin() == first_origin;
             let mut hop_headers = headers.clone();
-            let token = HeaderValue::from_str(token)
-                .map_err(|_| Error::protocol(url.path(), "the token is not a valid header"))?;
-            hop_headers.insert(AUTHORIZATION, token);
+            if !credentials {
+                for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION] {
+                    hop_headers.remove(name);
+                }
+            }
+            if authorized {
+                let token = match &token {
+                    Some(token) => token,
+                    None => &*token.insert(self.token(&mut budget).await?.0),
+                };
+                let value = HeaderValue::from_str(token)
+                    .map_err(|_| Error::protocol(url.path(), "the token is not a valid header"))?;
+                hop_headers.insert(AUTHORIZATION, value);
+            }
+            let api_permit = if openlist {
+                Some(self.admit_link_hop(&mut budget).await?)
+            } else {
+                None
+            };
             let response = self
                 .first_hop
                 .get(url.clone())
@@ -687,22 +691,31 @@ impl Inner {
                 .await
                 .map_err(|error| Error::transport(url.path(), error))?;
             drop(api_permit);
-            self.observe_openlist_answer(&response);
-            let Some(next) = redirect_target(&response) else {
-                return Ok(Transfer::new(response, permit));
-            };
-            url = next;
-        }
-        let mut headers = headers.clone();
-        if hops > 0 {
-            // The request left OpenList, so credentials meant for it must not
-            // reach the provider, as reqwest's own redirect handling ensures.
-            for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION] {
-                headers.remove(name);
+            if openlist {
+                self.observe_openlist_answer(&response);
+            } else if let Some(delay) = self.requested_pause(&response) {
+                self.admission.extend_transfer_cooldown(delay);
+            }
+            match redirect_target(&response) {
+                Some(next) => url = next,
+                None => return Ok(Transfer::new(response, permit)),
             }
         }
-        let response = self.send_transfer(&url, &headers).await?;
-        Ok(Transfer::new(response, permit))
+        Err(Error::protocol(url.path(), "too many redirects"))
+    }
+
+    /// Takes a link grant for a request to OpenList. A provider pause that
+    /// began while the request waited for its turn still applies, but is
+    /// waited out without the API slot.
+    async fn admit_link_hop(&self, budget: &mut WaitBudget) -> Result<Permit, Error> {
+        loop {
+            let permit = self.admission.acquire(RequestClass::Link, budget).await?;
+            if self.admission.transfer_cooldown_left().is_zero() {
+                return Ok(permit);
+            }
+            drop(permit);
+            self.admission.wait_transfer_cooldown(budget).await?;
+        }
     }
 
     /// Feeds OpenList's first answer back into the link budget and the
@@ -719,30 +732,6 @@ impl Inner {
             // 5xx.
             self.admission.on_throttle(RequestClass::Link);
         }
-    }
-
-    /// Sends a GET that follows redirects, which drop credentials when they
-    /// leave the host.
-    async fn send_transfer(
-        &self,
-        url: &Url,
-        headers: &HeaderMap,
-    ) -> Result<reqwest::Response, Error> {
-        let response = self
-            .transfer
-            .get(url.clone())
-            .headers(headers.clone())
-            .send()
-            .await
-            .map_err(|error| Error::transport(url.path(), error))?;
-        if let Some(delay) = self.requested_pause(&response) {
-            if self.is_openlist(response.url()) {
-                self.admission.extend_cooldown(delay);
-            } else {
-                self.admission.extend_transfer_cooldown(delay);
-            }
-        }
-        Ok(response)
     }
 
     /// Whether `url` is below OpenList's base URL. The path matters too,

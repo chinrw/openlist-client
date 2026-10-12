@@ -214,6 +214,9 @@ pub async fn start() -> Server {
         .route("/files/{*path}", get(serve_file))
         .route("/d/{*path}", get(download))
         .route("/hop/{*path}", get(hop))
+        .route("/back/{*path}", get(back))
+        .route("/bounce/{*path}", get(bounce))
+        .route("/not-modified/{*path}", get(not_modified))
         .route("/raw/{*path}", get(raw))
         .with_state(Arc::clone(&fake));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -466,6 +469,34 @@ async fn hop(
     fake.note_auth(format!("/hop/{path}"), &headers);
     let target = format!("{}/d/{path}", fake.base());
     (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+}
+
+/// An OpenList URL that redirects to a provider which sends the client
+/// back to OpenList's `/d`.
+async fn back(
+    State(fake): State<Arc<Fake>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    fake.note_auth(format!("/back/{path}"), &headers);
+    let target = format!("{}/bounce/{path}", fake.other_host());
+    (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+}
+
+async fn bounce(
+    State(fake): State<Arc<Fake>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    fake.note_auth(format!("/bounce/{path}"), &headers);
+    let target = format!("{}/d/{path}", fake.base());
+    (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]).into_response()
+}
+
+/// A 304 that carries a Location, which must not be followed.
+async fn not_modified(Path(path): Path<String>) -> Response {
+    let target = format!("/raw/{path}");
+    (StatusCode::NOT_MODIFIED, [(header::LOCATION, target)]).into_response()
 }
 
 /// A provider host that serves files to anyone.
