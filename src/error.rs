@@ -150,8 +150,12 @@ impl Error {
     }
 
     pub(crate) fn transport(path: &str, error: reqwest::Error) -> Self {
-        let retryable =
-            error.is_timeout() || error.is_connect() || error.is_body() || error.is_request();
+        // A body cut short while streaming surfaces as a decode error.
+        let retryable = error.is_timeout()
+            || error.is_connect()
+            || error.is_body()
+            || error.is_decode()
+            || error.is_request();
         // Without the URL, which can carry a signed provider link.
         let error = error.without_url();
         let mut message = error.to_string();

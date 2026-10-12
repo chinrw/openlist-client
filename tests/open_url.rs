@@ -204,3 +204,40 @@ async fn a_304_is_returned_rather_than_followed() {
     assert_eq!(transfer.status(), 304);
     assert!(server.fake.auth_seen.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_body_cut_short_is_a_retryable_transport_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort";
+        socket.write_all(reply).await.unwrap();
+    });
+    let server = start().await;
+    let client = server.client();
+    let url: Url = format!("http://{addr}/file").parse().unwrap();
+    let mut transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
+    let error = loop {
+        match transfer.chunk().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the body must not look complete"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(
+            error,
+            openlist_client::Error::Transport {
+                retryable: true,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
