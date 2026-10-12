@@ -68,6 +68,7 @@ pub struct Config {
 
 /// How the client authenticates to OpenList.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Auth {
     /// Logs in through `api/auth/login`, and again when OpenList rejects
     /// the token it issued.
@@ -76,6 +77,11 @@ pub enum Auth {
     /// fails the call with [`crate::Error::Login`], because the client has
     /// nothing to replace it with.
     Token(String),
+    /// Sends no token, so OpenList serves the requests as its guest user.
+    /// This only works where the guest user is enabled and may read the
+    /// paths in question. A rejection fails the call with
+    /// [`crate::Error::Login`].
+    Anonymous,
 }
 
 impl std::fmt::Debug for Auth {
@@ -87,6 +93,7 @@ impl std::fmt::Debug for Auth {
                 .field("password", &"<redacted>")
                 .finish(),
             Self::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+            Self::Anonymous => f.write_str("Anonymous"),
         }
     }
 }
@@ -107,6 +114,11 @@ impl Config {
     /// on OpenList's settings page.
     pub fn with_token(url: Url, token: impl Into<String>) -> Self {
         Self::with_auth(url, Auth::Token(token.into()))
+    }
+
+    /// Settings that send no credentials and act as OpenList's guest user.
+    pub fn anonymous(url: Url) -> Self {
+        Self::with_auth(url, Auth::Anonymous)
     }
 
     fn with_auth(url: Url, auth: Auth) -> Self {
@@ -237,6 +249,8 @@ mod tests {
         unpaced.link_rate = f64::INFINITY;
         unpaced.mutate_rate = f64::INFINITY;
         assert!(unpaced.check().is_ok());
+        let guest = Config::anonymous("http://openlist.test".parse().unwrap());
+        assert!(guest.check().is_ok());
         let mut bad = config();
         bad.auth = Auth::Token(String::new());
         assert!(bad.check().is_err());

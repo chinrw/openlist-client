@@ -132,7 +132,7 @@ impl Client {
                 token: Mutex::new(TokenState {
                     value: match &config.auth {
                         Auth::Token(token) => Some(token.clone()),
-                        Auth::Password { .. } => None,
+                        Auth::Password { .. } | Auth::Anonymous => None,
                     },
                     generation: 0,
                 }),
@@ -689,9 +689,12 @@ impl Inner {
                     Some(token) => token,
                     None => &*token.insert(self.token(&mut budget).await?.0),
                 };
-                let value = HeaderValue::from_str(token)
-                    .map_err(|_| Error::protocol(url.path(), "the token is not a valid header"))?;
-                hop_headers.insert(AUTHORIZATION, value);
+                if let Some(token) = token {
+                    let value = HeaderValue::from_str(token).map_err(|_| {
+                        Error::protocol(url.path(), "the token is not a valid header")
+                    })?;
+                    hop_headers.insert(AUTHORIZATION, value);
+                }
             }
             let api_permit = if openlist {
                 Some(self.admit_link_hop(&mut budget).await?)
@@ -826,7 +829,7 @@ impl Inner {
         let mut throttled = false;
         loop {
             let (token, generation) = self.token(&mut budget).await?;
-            let error = match self.send(spec, Some(&token), body, &mut budget).await {
+            let error = match self.send(spec, token.as_deref(), body, &mut budget).await {
                 Ok(value) => {
                     self.admission.on_success(spec.class);
                     return Ok(value);
@@ -862,9 +865,18 @@ impl Inner {
         }
     }
 
-    async fn token(&self, budget: &mut WaitBudget) -> Result<(String, u64), Error> {
-        let current =
-            |state: &TokenState| state.value.clone().map(|token| (token, state.generation));
+    /// The token to send and its generation. A guest sends none, and never
+    /// logs in.
+    async fn token(&self, budget: &mut WaitBudget) -> Result<(Option<String>, u64), Error> {
+        if matches!(self.config.auth, Auth::Anonymous) {
+            return Ok((None, 0));
+        }
+        let current = |state: &TokenState| {
+            state
+                .value
+                .clone()
+                .map(|token| (Some(token), state.generation))
+        };
         if let Some(found) = current(&self.token_state()) {
             return Ok(found);
         }
@@ -876,7 +888,7 @@ impl Inner {
         let mut state = self.token_state();
         state.value = Some(token.clone());
         state.generation += 1;
-        Ok((token, state.generation))
+        Ok((Some(token), state.generation))
     }
 
     async fn login_again(&self, rejected: u64, budget: &mut WaitBudget) -> Result<(), Error> {
@@ -899,6 +911,12 @@ impl Inner {
                 return Err(Error::Login {
                     code: 401,
                     message: "OpenList rejected the configured token".to_owned(),
+                });
+            }
+            Auth::Anonymous => {
+                return Err(Error::Login {
+                    code: 401,
+                    message: "OpenList refused the guest user".to_owned(),
                 });
             }
         };

@@ -42,7 +42,9 @@ for found in client.walk("/media").await? {
 `Config::new` logs in with a username and password and logs in again when the
 token expires. `Config::with_token` sends a token you already have, such as the
 admin token on OpenList's settings page, and never logs in. If OpenList rejects
-that token, the call fails with `Error::Login`.
+that token, the call fails with `Error::Login`. `Config::anonymous` sends no
+token and acts as OpenList's guest user, which must be enabled and allowed to
+read the paths you use. A refused guest also fails with `Error::Login`.
 
 `Client::link` and `Client::open` call `fs/link`, which needs an admin account
 whose base path is `/`. `Client::open_url` opens a `raw_url` from `Client::get`

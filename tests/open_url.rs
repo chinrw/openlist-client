@@ -38,6 +38,26 @@ async fn a_d_link_carries_the_token_only_to_openlist() {
 }
 
 #[tokio::test]
+async fn a_guest_opens_a_d_link_without_a_token() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a.mp3", 1)]);
+    let client = Client::new(server.guest_config()).unwrap();
+
+    let url: Url = format!("{}/d/w/a.mp3", server.url).parse().unwrap();
+    let transfer = client.open_url(&url, &HeaderMap::new()).await.unwrap();
+    assert_eq!(body(transfer).await, "contents of /w/a.mp3");
+    assert_eq!(server.fake.logins(), 0);
+    let seen = server.fake.auth_seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            ("/d/w/a.mp3".to_owned(), false),
+            ("/raw/w/a.mp3".to_owned(), false)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_provider_url_is_neither_paced_nor_authorized() {
     let server = start().await;
     let mut config = server.config();

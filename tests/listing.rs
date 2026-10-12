@@ -179,6 +179,30 @@ async fn a_rejected_fixed_token_is_a_login_error_without_a_login() {
 }
 
 #[tokio::test]
+async fn a_guest_lists_without_a_token_or_a_login() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a", 1)]);
+    server.fake.enable_guest();
+    let client = Client::new(server.guest_config()).unwrap();
+    // The fake rejects any Authorization header it did not issue, so a
+    // success shows the guest sent none.
+    let listing = client.list("/w").await.unwrap();
+    assert_eq!(listing.entries.len(), 1);
+    assert_eq!(server.fake.logins(), 0);
+}
+
+#[tokio::test]
+async fn a_refused_guest_is_a_login_error_without_a_login() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a", 1)]);
+    let client = Client::new(server.guest_config()).unwrap();
+    let error = client.list("/w").await.unwrap_err();
+    assert!(matches!(error, Error::Login { code: 401, .. }), "{error:?}");
+    assert_eq!(server.fake.logins(), 0);
+    assert_eq!(server.fake.hits("list", "/w"), 1);
+}
+
+#[tokio::test]
 async fn listings_are_served_from_memory_until_their_ttl() {
     let server = start().await;
     server.fake.put("/w", vec![file("a", 1)]);

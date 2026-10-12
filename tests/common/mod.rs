@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -69,6 +69,8 @@ pub struct Fake {
     tree: Mutex<HashMap<String, Vec<FakeFile>>>,
     faults: Mutex<HashMap<(String, String), VecDeque<Fault>>>,
     tokens: Mutex<Vec<String>>,
+    /// Whether a request without a token is served as the guest user.
+    guest: AtomicBool,
     issued: AtomicUsize,
     /// Requests per endpoint and path, faults included.
     hits: Mutex<HashMap<(String, String), usize>>,
@@ -137,6 +139,12 @@ impl Fake {
         self.tokens.lock().unwrap().push(token.into());
     }
 
+    /// Serves requests that carry no token, as OpenList does when its guest
+    /// user is enabled.
+    pub fn enable_guest(&self) {
+        self.guest.store(true, Ordering::SeqCst);
+    }
+
     /// Revokes every token, as a password change or expiry would.
     pub fn expire_tokens(&self) {
         self.tokens.lock().unwrap().clear();
@@ -149,10 +157,10 @@ impl Fake {
     }
 
     fn authorized(&self, headers: &HeaderMap) -> bool {
-        let Some(token) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-        else {
+        let Some(token) = headers.get(header::AUTHORIZATION) else {
+            return self.guest.load(Ordering::SeqCst);
+        };
+        let Ok(token) = token.to_str() else {
             return false;
         };
         self.tokens.lock().unwrap().iter().any(|t| t == token)
@@ -195,6 +203,14 @@ impl Server {
     /// Settings that send `token` instead of logging in.
     pub fn token_config(&self, token: &str) -> Config {
         let mut config = Config::with_token(self.url.parse().unwrap(), token);
+        config.retry_delay = Duration::from_millis(1);
+        config.link_rate = 1000.0;
+        config
+    }
+
+    /// Settings that send no token.
+    pub fn guest_config(&self) -> Config {
+        let mut config = Config::anonymous(self.url.parse().unwrap());
         config.retry_delay = Duration::from_millis(1);
         config.link_rate = 1000.0;
         config
