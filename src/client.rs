@@ -24,8 +24,8 @@ use crate::{
     limit::RequestClass,
     path,
     types::{
-        Envelope, ListRequest, LoginData, LoginRequest, PathRequest, WireFileInfo, WireLink,
-        WireListing,
+        Envelope, ListRequest, LoginData, LoginRequest, PathRequest, RemoveRequest, WireFileInfo,
+        WireLink, WireListing,
     },
 };
 
@@ -112,6 +112,7 @@ impl Client {
                     config.max_api_requests,
                     config.list_concurrency,
                     config.link_rate,
+                    config.mutate_rate,
                 )),
                 transfers: Arc::new(Semaphore::new(config.max_transfers)),
                 listings: Cache::new(config.listing_cache_capacity, usize::MAX),
@@ -275,6 +276,45 @@ impl Client {
                 Ok((link, ttl))
             })
             .await
+    }
+
+    /// Deletes `names` from the directory `dir` with one `fs/remove` call.
+    ///
+    /// The request is paced on its own budget (`mutate_rate`) and sent once,
+    /// never retried, because a timeout leaves it unknown whether the
+    /// provider deleted anything. Cached listings and links for `dir` and
+    /// everything below the removed names are dropped whatever the outcome,
+    /// since even a rejected request may have deleted some entries.
+    ///
+    /// # Errors
+    /// [`Error::InvalidPath`] for a name that cannot be sent. Otherwise
+    /// [`Error::Transport`] means the outcome is unknown, and an
+    /// [`Error::Api`] or [`Error::Http`] rejection may still have had partial
+    /// effects.
+    pub async fn remove(&self, dir: &str, names: &[String]) -> Result<(), Error> {
+        let dir = path::normalize(dir)?;
+        let targets = names
+            .iter()
+            .map(|name| path::join(&dir, name))
+            .collect::<Result<Vec<_>, _>>()?;
+        if names.is_empty() {
+            return Ok(());
+        }
+        let spec = self
+            .inner
+            .spec(RequestClass::Mutate, "api/fs/remove", &dir, false);
+        let body = RemoveRequest { dir: &dir, names };
+        let result = self
+            .inner
+            .call::<_, serde::de::IgnoredAny>(&spec, &body)
+            .await
+            .map(drop);
+        self.inner.listings.invalidate(&dir);
+        for target in &targets {
+            self.inner.listings.invalidate_tree(target);
+            self.inner.links.invalidate_tree(target);
+        }
+        result
     }
 
     /// Forgets a cached link, for example after the provider rejected it.
@@ -752,9 +792,13 @@ impl Inner {
                 message: clean_body(envelope.message.as_bytes()),
             });
         }
-        envelope
-            .data
-            .ok_or_else(|| Error::protocol(path, "response has no data"))
+        match envelope.data {
+            Some(data) => Ok(data),
+            // `fs/remove` and other writes answer `data: null`, which only a
+            // `T` such as `IgnoredAny` accepts.
+            None => serde_json::from_value(serde_json::Value::Null)
+                .map_err(|_| Error::protocol(path, "response has no data")),
+        }
     }
 
     /// Exponential backoff with full jitter, so concurrent failures do not

@@ -6,7 +6,7 @@ use std::time::Duration;
 use url::Url;
 
 /// Slower rates make the pacing interval overflow `Duration`.
-const MIN_LINK_RATE: f64 = 0.001;
+const MIN_RATE: f64 = 0.001;
 
 /// Settings for one [`crate::Client`]. Build with [`Config::new`] and change
 /// the public fields as needed.
@@ -24,6 +24,9 @@ pub struct Config {
     /// `fs/link` and `fs/get` requests per second. Halved while the provider
     /// throttles.
     pub link_rate: f64,
+    /// `fs/remove` requests per second, on a budget separate from links.
+    /// Halved while the provider throttles.
+    pub mutate_rate: f64,
     /// API requests in flight at once across all classes.
     pub max_api_requests: usize,
     /// File transfers open at once. Transfers have their own limit because a
@@ -112,6 +115,7 @@ impl Config {
             user_agent: concat!("openlist-client/", env!("CARGO_PKG_VERSION")).to_owned(),
             list_concurrency: 4,
             link_rate: 1.0,
+            mutate_rate: 1.0,
             max_api_requests: 8,
             max_transfers: 16,
             per_page: 0,
@@ -147,8 +151,9 @@ impl Config {
             Auth::Token(token) if token.is_empty() => return fail("token is empty"),
             _ => {}
         }
-        if !(self.link_rate.is_finite() && self.link_rate >= MIN_LINK_RATE) {
-            return fail("link_rate must be at least 0.001 per second");
+        let usable = |rate: f64| rate.is_finite() && rate >= MIN_RATE;
+        if !usable(self.link_rate) || !usable(self.mutate_rate) {
+            return fail("link_rate and mutate_rate must be at least 0.001 per second");
         }
         if self.list_concurrency == 0 || self.max_api_requests == 0 || self.max_transfers == 0 {
             return fail("concurrency limits must be at least 1");
@@ -171,6 +176,7 @@ impl std::fmt::Debug for Config {
             .field("user_agent", &self.user_agent)
             .field("list_concurrency", &self.list_concurrency)
             .field("link_rate", &self.link_rate)
+            .field("mutate_rate", &self.mutate_rate)
             .field("max_api_requests", &self.max_api_requests)
             .field("max_transfers", &self.max_transfers)
             .field("per_page", &self.per_page)

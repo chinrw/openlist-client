@@ -17,13 +17,17 @@ pub(crate) enum RequestClass {
     /// `fs/link` and `fs/get`, which call the provider on every request.
     /// Limited by requests per second.
     Link,
+    /// `fs/remove`, which calls the provider on every request. Limited by
+    /// requests per second, on a budget of its own so a cleanup does not
+    /// slow down playback links.
+    Mutate,
     /// Login. Never reaches the provider, so only the shared slots apply.
     Control,
 }
 
 impl RequestClass {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 3] = [Self::List, Self::Link, Self::Control];
+    pub(crate) const ALL: [Self; 4] = [Self::List, Self::Link, Self::Mutate, Self::Control];
 }
 
 /// Successes a throttled budget needs before it grows again.

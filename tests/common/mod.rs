@@ -185,6 +185,7 @@ pub async fn start() -> Server {
         .route("/api/fs/list", post(list))
         .route("/api/fs/get", post(fs_get))
         .route("/api/fs/link", post(link))
+        .route("/api/fs/remove", post(remove))
         .route("/files/{*path}", get(serve_file))
         .with_state(Arc::clone(&fake));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -380,6 +381,32 @@ async fn serve_file(
         }
         None => body.into_response(),
     }
+}
+
+async fn remove(
+    State(fake): State<Arc<Fake>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let dir = body["dir"].as_str().unwrap_or_default().to_owned();
+    if let Some(fault) = fake.take_fault("remove", &dir) {
+        return fault_response(fault);
+    }
+    if !fake.authorized(&headers) {
+        return code(401, "token is expired");
+    }
+    let names: Vec<String> = serde_json::from_value(body["names"].clone()).unwrap();
+    let mut tree = fake.tree.lock().unwrap();
+    let Some(entries) = tree.get_mut(&dir) else {
+        return code(500, "failed remove: object not found");
+    };
+    entries.retain(|entry| !names.contains(&entry.name));
+    let base = dir.trim_end_matches('/').to_owned();
+    for name in &names {
+        let root = format!("{base}/{name}");
+        tree.retain(|path, _| path != &root && !path.starts_with(&format!("{root}/")));
+    }
+    Json(json!({"code": 200, "message": "success", "data": null})).into_response()
 }
 
 fn find(fake: &Fake, path: &str) -> Option<FakeFile> {

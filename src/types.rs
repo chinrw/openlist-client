@@ -214,6 +214,12 @@ pub(crate) struct PathRequest<'a> {
 }
 
 #[derive(Serialize)]
+pub(crate) struct RemoveRequest<'a> {
+    pub dir: &'a str,
+    pub names: &'a [String],
+}
+
+#[derive(Serialize)]
 pub(crate) struct LoginRequest<'a> {
     pub username: &'a str,
     pub password: &'a str,

@@ -34,6 +34,8 @@ pub(crate) struct Admission {
     /// Serializes link admission, so one link request at a time holds a
     /// slot while it waits for the pacer.
     link_gate: AsyncMutex<()>,
+    mutate: Mutex<Pacer>,
+    mutate_gate: AsyncMutex<()>,
     list: Mutex<Window>,
     cooldown_until: Mutex<Instant>,
     /// A pause started by the storage provider's own 429 or 503 on a file
@@ -70,6 +72,8 @@ pub struct Limits {
     /// Current link requests per second, below the configured rate while
     /// the provider throttles.
     pub link_rate: f64,
+    /// Current `fs/remove` requests per second.
+    pub mutate_rate: f64,
     /// Current number of listings allowed in flight.
     pub list_window: usize,
     /// Time left in a client-wide pause after a 429 or 503.
@@ -77,11 +81,18 @@ pub struct Limits {
 }
 
 impl Admission {
-    pub(crate) fn new(slots: usize, list_concurrency: usize, link_rate: f64) -> Self {
+    pub(crate) fn new(
+        slots: usize,
+        list_concurrency: usize,
+        link_rate: f64,
+        mutate_rate: f64,
+    ) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(slots)),
             link: Mutex::new(Pacer::new(link_rate)),
             link_gate: AsyncMutex::new(()),
+            mutate: Mutex::new(Pacer::new(mutate_rate)),
+            mutate_gate: AsyncMutex::new(()),
             list: Mutex::new(Window::new(list_concurrency)),
             cooldown_until: Mutex::new(Instant::now()),
             transfer_cooldown_until: Mutex::new(Instant::now()),
@@ -94,8 +105,12 @@ impl Admission {
         self.list.lock().expect("window mutex poisoned")
     }
 
-    fn pacer(&self) -> MutexGuard<'_, Pacer> {
-        self.link.lock().expect("pacer mutex poisoned")
+    fn pacer(&self, class: RequestClass) -> MutexGuard<'_, Pacer> {
+        let pacer = match class {
+            RequestClass::Mutate => &self.mutate,
+            _ => &self.link,
+        };
+        pacer.lock().expect("pacer mutex poisoned")
     }
 
     fn cooldown_left(&self) -> Duration {
@@ -105,7 +120,8 @@ impl Admission {
 
     pub(crate) fn limits(&self) -> Limits {
         Limits {
-            link_rate: self.pacer().rate(),
+            link_rate: self.pacer(RequestClass::Link).rate(),
+            mutate_rate: self.pacer(RequestClass::Mutate).rate(),
             list_window: self.window().size(),
             cooldown: self.cooldown_left(),
         }
@@ -122,14 +138,18 @@ impl Admission {
         loop {
             self.wait_cooldown(budget).await?;
             let permit = match class {
-                RequestClass::Link => {
+                RequestClass::Link | RequestClass::Mutate => {
+                    let gate = match class {
+                        RequestClass::Mutate => &self.mutate_gate,
+                        _ => &self.link_gate,
+                    };
                     // The slot is taken before the pacer grant, and both under
                     // the gate, so grants cannot pile up while slots are full
                     // and then fire together.
-                    let _gate = self.link_gate.lock().await;
+                    let _gate = gate.lock().await;
                     let slot = self.slot().await;
                     loop {
-                        let reserved = self.pacer().reserve(Instant::now());
+                        let reserved = self.pacer(class).reserve(Instant::now());
                         match reserved {
                             Ok(()) => break,
                             Err(wait) => tokio::time::sleep(wait).await,
@@ -216,7 +236,7 @@ impl Admission {
 
     pub(crate) fn on_success(&self, class: RequestClass) {
         match class {
-            RequestClass::Link => self.pacer().on_success(),
+            RequestClass::Link | RequestClass::Mutate => self.pacer(class).on_success(),
             RequestClass::List => self.window().on_success(),
             RequestClass::Control => {}
         }
@@ -224,7 +244,9 @@ impl Admission {
 
     pub(crate) fn on_throttle(&self, class: RequestClass) {
         match class {
-            RequestClass::Link => self.pacer().on_throttle(Instant::now()),
+            RequestClass::Link | RequestClass::Mutate => {
+                self.pacer(class).on_throttle(Instant::now());
+            }
             RequestClass::List => self.window().on_throttle(),
             RequestClass::Control => {}
         }
@@ -284,7 +306,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cooldown_beyond_the_budget_fails_without_waiting() {
-        let admission = Arc::new(Admission::new(4, 4, 1.0));
+        let admission = Arc::new(Admission::new(4, 4, 1.0, 1.0));
         admission.extend_cooldown(Duration::from_secs(30));
         let mut budget = WaitBudget::new(Duration::from_secs(10));
         let start = Instant::now();
@@ -295,7 +317,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cooldown_within_the_budget_is_waited_out_and_charged() {
-        let admission = Arc::new(Admission::new(4, 4, 1.0));
+        let admission = Arc::new(Admission::new(4, 4, 1.0, 1.0));
         admission.extend_cooldown(Duration::from_secs(3));
         let mut budget = WaitBudget::new(Duration::from_secs(10));
         let start = Instant::now();
@@ -309,7 +331,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn link_grants_follow_the_rate() {
-        let admission = Arc::new(Admission::new(8, 4, 2.0));
+        let admission = Arc::new(Admission::new(8, 4, 2.0, 1.0));
         let mut budget = WaitBudget::new(Duration::ZERO);
         let start = Instant::now();
         for _ in 0..5 {
@@ -324,8 +346,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn removals_are_paced_apart_from_links() {
+        let admission = Arc::new(Admission::new(8, 4, 1.0, 0.5));
+        let mut budget = WaitBudget::new(Duration::ZERO);
+        let start = Instant::now();
+        for class in [RequestClass::Mutate, RequestClass::Link] {
+            drop(admission.acquire(class, &mut budget).await.unwrap());
+        }
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "each class has its own grant"
+        );
+        drop(
+            admission
+                .acquire(RequestClass::Mutate, &mut budget)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        admission.on_throttle(RequestClass::Mutate);
+        assert_eq!(admission.limits().mutate_rate, 0.25);
+        assert_eq!(admission.limits().link_rate, 1.0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn list_window_blocks_until_a_place_frees() {
-        let admission = Arc::new(Admission::new(8, 2, 1.0));
+        let admission = Arc::new(Admission::new(8, 2, 1.0, 1.0));
         let mut budget = WaitBudget::new(Duration::ZERO);
         let first = admission
             .acquire(RequestClass::List, &mut budget)
@@ -353,7 +400,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cooldown_that_starts_while_queued_is_waited_out() {
-        let admission = Arc::new(Admission::new(8, 1, 1.0));
+        let admission = Arc::new(Admission::new(8, 1, 1.0, 1.0));
         let mut budget = WaitBudget::new(Duration::from_secs(60));
         let first = admission
             .acquire(RequestClass::List, &mut budget)
@@ -379,7 +426,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_extension_beyond_the_budget_fails_a_waiting_call_at_once() {
-        let admission = Arc::new(Admission::new(4, 4, 1.0));
+        let admission = Arc::new(Admission::new(4, 4, 1.0, 1.0));
         admission.extend_cooldown(Duration::from_secs(119));
         let waiter = {
             let admission = Arc::clone(&admission);
@@ -399,7 +446,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_provider_pause_holds_back_transfers_but_not_api_calls() {
-        let admission = Arc::new(Admission::new(4, 4, 1.0));
+        let admission = Arc::new(Admission::new(4, 4, 1.0, 1.0));
         admission.extend_transfer_cooldown(Duration::from_secs(86_400));
         let mut budget = WaitBudget::new(Duration::from_secs(10));
         admission

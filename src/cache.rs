@@ -234,6 +234,14 @@ impl<V: Clone + Send + Sync + 'static> Cache<V> {
         self.slots().remove(key);
     }
 
+    /// Drops `root` and every key below it, as [`Cache::invalidate`] does
+    /// for one key.
+    pub(crate) fn invalidate_tree(&self, root: &str) {
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        self.slots()
+            .retain(|key, _| key != root && !key.starts_with(&prefix));
+    }
+
     /// Drops the key only if its cached value matches, so a value another
     /// task just stored survives.
     pub(crate) fn remove_if(&self, key: &str, matches: impl FnOnce(&V) -> bool) {
