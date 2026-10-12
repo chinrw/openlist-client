@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    Config, ConfigError, Entry, Error, FileInfo, Link, Listing, Transfer, WalkEntry,
+    Auth, Config, ConfigError, Entry, Error, FileInfo, Link, Listing, Transfer, WalkEntry,
     admission::{Admission, Limits, WaitBudget, retry_after},
     cache::Cache,
     error::{NOT_FOUND_MARKER, clean_body},
@@ -116,7 +116,13 @@ impl Client {
                 transfers: Arc::new(Semaphore::new(config.max_transfers)),
                 listings: Cache::new(config.listing_cache_capacity, usize::MAX),
                 links: Cache::new(config.link_cache_capacity, config.max_pending_links),
-                token: Mutex::new(TokenState::default()),
+                token: Mutex::new(TokenState {
+                    value: match &config.auth {
+                        Auth::Token(token) => Some(token.clone()),
+                        Auth::Password { .. } => None,
+                    },
+                    generation: 0,
+                }),
                 login_lock: AsyncMutex::new(()),
                 base,
                 api,
@@ -626,11 +632,17 @@ impl Inner {
     }
 
     async fn login(&self, budget: &mut WaitBudget) -> Result<String, Error> {
-        let spec = self.spec(RequestClass::Control, "api/auth/login", "/", true);
-        let body = LoginRequest {
-            username: &self.config.username,
-            password: &self.config.password,
+        let (username, password) = match &self.config.auth {
+            Auth::Password { username, password } => (username, password),
+            Auth::Token(_) => {
+                return Err(Error::Login {
+                    code: 401,
+                    message: "OpenList rejected the configured token".to_owned(),
+                });
+            }
         };
+        let spec = self.spec(RequestClass::Control, "api/auth/login", "/", true);
+        let body = LoginRequest { username, password };
         let mut attempt = 1;
         loop {
             match self.send::<_, LoginData>(&spec, None, &body, budget).await {

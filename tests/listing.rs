@@ -2,8 +2,8 @@ mod common;
 
 use std::{sync::atomic::Ordering, time::Duration};
 
-use common::{Fault, dir, file, start};
-use openlist_client::{Client, Error, ErrorKind};
+use common::{Fault, USER, dir, file, start};
+use openlist_client::{Auth, Client, Error, ErrorKind};
 
 #[tokio::test]
 async fn list_reads_every_page() {
@@ -145,11 +145,37 @@ async fn an_expired_token_triggers_exactly_one_new_login() {
 async fn a_wrong_password_is_a_login_error() {
     let server = start().await;
     let mut config = server.config();
-    config.password = "wrong".into();
+    config.auth = Auth::Password {
+        username: USER.into(),
+        password: "wrong".into(),
+    };
     let client = Client::new(config).unwrap();
     let error = client.list("/").await.unwrap_err();
     assert!(matches!(error, Error::Login { code: 400, .. }), "{error:?}");
     assert_eq!(error.kind(), ErrorKind::Unavailable);
+}
+
+#[tokio::test]
+async fn a_fixed_token_is_sent_without_logging_in() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a", 1)]);
+    server.fake.accept_token("settings-token");
+    let client = Client::new(server.token_config("settings-token")).unwrap();
+    let listing = client.list("/w").await.unwrap();
+    assert_eq!(listing.entries.len(), 1);
+    assert_eq!(server.fake.logins(), 0);
+}
+
+#[tokio::test]
+async fn a_rejected_fixed_token_is_a_login_error_without_a_login() {
+    let server = start().await;
+    server.fake.put("/w", vec![file("a", 1)]);
+    let client = Client::new(server.token_config("revoked-token")).unwrap();
+    let error = client.list("/w").await.unwrap_err();
+    assert!(matches!(error, Error::Login { code: 401, .. }), "{error:?}");
+    assert_eq!(server.fake.logins(), 0);
+    // The rejection is not retried: one request, then the error.
+    assert_eq!(server.fake.hits("list", "/w"), 1);
 }
 
 #[tokio::test]

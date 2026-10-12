@@ -47,7 +47,7 @@ mod types;
 
 pub use admission::Limits;
 pub use client::Client;
-pub use config::{Config, ConfigError};
+pub use config::{Auth, Config, ConfigError};
 pub use error::{Error, ErrorKind};
 pub use transfer::Transfer;
 pub use types::{Entry, FileInfo, Link, Listing, ListingDigest, WalkEntry};

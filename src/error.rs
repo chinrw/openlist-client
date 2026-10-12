@@ -35,7 +35,8 @@ pub enum Error {
         message: String,
         retryable: bool,
     },
-    /// The configured account could not log in.
+    /// OpenList refused the configured credentials: the login failed, or
+    /// it rejected a token given with [`crate::Config::with_token`].
     #[error("OpenList login failed (code {code})")]
     Login { code: i64, message: String },
     /// OpenList asked the client to pause for longer than the wait budget

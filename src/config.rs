@@ -15,8 +15,7 @@ pub struct Config {
     /// OpenList's base URL. A path prefix is kept, for a reverse proxy that
     /// serves OpenList under one.
     pub url: Url,
-    pub username: String,
-    pub password: String,
+    pub auth: Auth,
     /// Sent with API requests and file transfers alike. 115 ties a link to
     /// the user agent that asked for it, so the two must match.
     pub user_agent: String,
@@ -63,12 +62,53 @@ pub struct Config {
     pub max_pending_links: usize,
 }
 
+/// How the client authenticates to OpenList.
+#[derive(Clone)]
+pub enum Auth {
+    /// Logs in through `api/auth/login`, and again when OpenList rejects
+    /// the token it issued.
+    Password { username: String, password: String },
+    /// Sends this token unchanged and never logs in. OpenList rejecting it
+    /// fails the call with [`crate::Error::Login`], because the client has
+    /// nothing to replace it with.
+    Token(String),
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password { username, .. } => f
+                .debug_struct("Password")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+        }
+    }
+}
+
 impl Config {
+    /// Settings that log in with a username and password.
     pub fn new(url: Url, username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self::with_auth(
+            url,
+            Auth::Password {
+                username: username.into(),
+                password: password.into(),
+            },
+        )
+    }
+
+    /// Settings that send a token issued elsewhere, such as the admin token
+    /// on OpenList's settings page.
+    pub fn with_token(url: Url, token: impl Into<String>) -> Self {
+        Self::with_auth(url, Auth::Token(token.into()))
+    }
+
+    fn with_auth(url: Url, auth: Auth) -> Self {
         Self {
             url,
-            username: username.into(),
-            password: password.into(),
+            auth,
             user_agent: concat!("openlist-client/", env!("CARGO_PKG_VERSION")).to_owned(),
             list_concurrency: 4,
             link_rate: 1.0,
@@ -100,8 +140,12 @@ impl Config {
         if !self.url.username().is_empty() || self.url.password().is_some() {
             return fail("put credentials in username and password, not in the url");
         }
-        if self.username.is_empty() {
-            return fail("username is empty");
+        match &self.auth {
+            Auth::Password { username, .. } if username.is_empty() => {
+                return fail("username is empty");
+            }
+            Auth::Token(token) if token.is_empty() => return fail("token is empty"),
+            _ => {}
         }
         if !(self.link_rate.is_finite() && self.link_rate >= MIN_LINK_RATE) {
             return fail("link_rate must be at least 0.001 per second");
@@ -123,8 +167,7 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("url", &self.url.as_str())
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
+            .field("auth", &self.auth)
             .field("user_agent", &self.user_agent)
             .field("list_concurrency", &self.list_concurrency)
             .field("link_rate", &self.link_rate)
@@ -156,6 +199,12 @@ mod tests {
     }
 
     #[test]
+    fn debug_hides_the_token() {
+        let config = Config::with_token("http://openlist.test".parse().unwrap(), "openlist-abc");
+        assert!(!format!("{config:?}").contains("openlist-abc"));
+    }
+
+    #[test]
     fn check_rejects_settings_that_cannot_work() {
         assert!(config().check().is_ok());
         let mut bad = config();
@@ -172,6 +221,15 @@ mod tests {
         assert!(bad.check().is_err());
         let mut bad = config();
         bad.link_rate = 1e-20;
+        assert!(bad.check().is_err());
+        let mut bad = config();
+        bad.auth = Auth::Token(String::new());
+        assert!(bad.check().is_err());
+        let mut bad = config();
+        bad.auth = Auth::Password {
+            username: String::new(),
+            password: "secret".into(),
+        };
         assert!(bad.check().is_err());
     }
 }

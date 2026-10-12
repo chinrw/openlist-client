@@ -121,6 +121,11 @@ impl Fake {
         self.issued.load(Ordering::SeqCst)
     }
 
+    /// Accepts `token` without a login, like a token from the settings page.
+    pub fn accept_token(&self, token: &str) {
+        self.tokens.lock().unwrap().push(token.into());
+    }
+
     /// Revokes every token, as a password change or expiry would.
     pub fn expire_tokens(&self) {
         self.tokens.lock().unwrap().clear();
@@ -155,6 +160,14 @@ pub struct Server {
 impl Server {
     pub fn config(&self) -> Config {
         let mut config = Config::new(self.url.parse().unwrap(), USER, PASSWORD);
+        config.retry_delay = Duration::from_millis(1);
+        config.link_rate = 1000.0;
+        config
+    }
+
+    /// Settings that send `token` instead of logging in.
+    pub fn token_config(&self, token: &str) -> Config {
+        let mut config = Config::with_token(self.url.parse().unwrap(), token);
         config.retry_delay = Duration::from_millis(1);
         config.link_rate = 1000.0;
         config
