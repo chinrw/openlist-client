@@ -290,3 +290,19 @@ async fn a_pause_beyond_the_budget_fails_the_request_that_received_it() {
     let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
     assert!(matches!(error, Error::RateLimited), "{error:?}");
 }
+
+#[tokio::test]
+async fn a_provider_pause_beyond_the_budget_is_rate_limited_before_capping() {
+    let server = start().await;
+    server
+        .fake
+        .fault("raw", "/w/a.nfo", Fault::Status(503, Some("3600")));
+    let mut config = server.config();
+    config.cooldown_budget = Duration::from_secs(300);
+    let client = Client::new(config).unwrap();
+    let url: Url = format!("{}/raw/w/a.nfo", server.fake.other_host())
+        .parse()
+        .unwrap();
+    let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
+    assert!(matches!(error, Error::RateLimited), "{error:?}");
+}

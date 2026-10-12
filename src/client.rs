@@ -707,13 +707,15 @@ impl Inner {
                 .map_err(|error| Error::transport(url.path(), error))?;
             drop(api_permit);
             let pause_left = match (self.requested_pause(&response), openlist) {
+                // The pause is stored capped, but a request beyond the budget
+                // is judged on what the server asked for.
                 (Some(delay), true) => {
                     self.admission.extend_cooldown(delay);
-                    self.admission.cooldown_left()
+                    delay.max(self.admission.cooldown_left())
                 }
                 (Some(delay), false) => {
                     self.admission.extend_transfer_cooldown(delay);
-                    self.admission.transfer_cooldown_left()
+                    delay.max(self.admission.transfer_cooldown_left())
                 }
                 (None, _) => Duration::ZERO,
             };

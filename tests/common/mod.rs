@@ -511,6 +511,9 @@ async fn raw(
     headers: HeaderMap,
 ) -> Response {
     fake.note_auth(format!("/raw/{path}"), &headers);
+    if let Some(fault) = fake.take_fault("raw", &format!("/{path}")) {
+        return fault_response(fault);
+    }
     let delay = *fake.raw_delay.lock().unwrap();
     tokio::time::sleep(delay).await;
     format!("contents of /{path}").into_response()
