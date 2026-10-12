@@ -90,6 +90,9 @@ pub struct Fake {
     pub vanish_after_first_page: Mutex<Option<String>>,
     /// After page 1 of this path is served, one more entry appears.
     pub grow_after_first_page: Mutex<Option<String>>,
+    /// Whether each `/d` and `/raw` request carried an Authorization
+    /// header, in order.
+    pub auth_seen: Mutex<Vec<(String, bool)>>,
     addr: Mutex<Option<SocketAddr>>,
 }
 
@@ -150,6 +153,17 @@ impl Fake {
     fn base(&self) -> String {
         format!("http://{}", self.addr.lock().unwrap().unwrap())
     }
+
+    /// The same server under another host name, as a provider host would be.
+    pub fn other_host(&self) -> String {
+        let port = self.addr.lock().unwrap().unwrap().port();
+        format!("http://localhost:{port}")
+    }
+
+    fn note_auth(&self, path: String, headers: &HeaderMap) {
+        let seen = headers.contains_key(header::AUTHORIZATION);
+        self.auth_seen.lock().unwrap().push((path, seen));
+    }
 }
 
 pub struct Server {
@@ -187,6 +201,8 @@ pub async fn start() -> Server {
         .route("/api/fs/link", post(link))
         .route("/api/fs/remove", post(remove))
         .route("/files/{*path}", get(serve_file))
+        .route("/d/{*path}", get(download))
+        .route("/raw/{*path}", get(raw))
         .with_state(Arc::clone(&fake));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -407,6 +423,33 @@ async fn remove(
         tree.retain(|path, _| path != &root && !path.starts_with(&format!("{root}/")));
     }
     Json(json!({"code": 200, "message": "success", "data": null})).into_response()
+}
+
+/// OpenList's `/d`: asks the provider for a link and redirects to it.
+async fn download(
+    State(fake): State<Arc<Fake>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    fake.note_auth(format!("/d/{path}"), &headers);
+    if let Some(fault) = fake.take_fault("d", &format!("/{path}")) {
+        return fault_response(fault);
+    }
+    if find(&fake, &format!("/{path}")).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let target = format!("{}/raw/{path}", fake.other_host());
+    (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+}
+
+/// A provider host that serves files to anyone.
+async fn raw(
+    State(fake): State<Arc<Fake>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    fake.note_auth(format!("/raw/{path}"), &headers);
+    format!("contents of /{path}").into_response()
 }
 
 fn find(fake: &Fake, path: &str) -> Option<FakeFile> {

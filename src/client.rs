@@ -414,6 +414,27 @@ impl Client {
         }
         Ok(transfer)
     }
+
+    /// Opens a URL that did not come from [`Client::link`], such as the
+    /// `raw_url` of [`Client::get`] or an OpenList `/d` link built from an
+    /// entry's `sign`, forwarding `headers` such as `Range`. Unlike
+    /// [`Client::open`] it needs no admin account.
+    ///
+    /// A URL on OpenList's own origin makes OpenList ask the provider for
+    /// the file, so it waits for the link budget like [`Client::link`] and
+    /// carries the token, which redirects to another host drop. Any other
+    /// URL is a plain transfer, limited only by `max_transfers`.
+    ///
+    /// Nothing is retried. The caller reads the status, including a 403
+    /// from an expired link.
+    ///
+    /// # Errors
+    /// [`Error::RateLimited`] when a pause outlasts the wait budget,
+    /// [`Error::InvalidPath`] for a URL that is not http(s), and connection
+    /// failures.
+    pub async fn open_url(&self, url: &Url, headers: &HeaderMap) -> Result<Transfer, Error> {
+        self.inner.open_url(url, headers).await
+    }
 }
 
 impl std::fmt::Debug for Client {
@@ -551,14 +572,8 @@ impl Inner {
         link: &Link,
         headers: &HeaderMap,
     ) -> Result<Transfer, Error> {
-        // Transfers honour the client-wide pause like API calls, checked
-        // again after the slot wait for the same reason as in admission.
         let mut budget = WaitBudget::new(self.config.cooldown_budget);
-        self.admission.wait_transfer_cooldown(&mut budget).await?;
-        let Ok(permit) = Arc::clone(&self.transfers).acquire_owned().await else {
-            unreachable!("the transfer semaphore is never closed");
-        };
-        self.admission.wait_transfer_cooldown(&mut budget).await?;
+        let permit = self.transfer_slot(&mut budget).await?;
         let mut merged = headers.clone();
         // The provider's headers win, because the link only works with them.
         for name in link.headers.keys() {
@@ -578,6 +593,76 @@ impl Inner {
             self.admission.extend_transfer_cooldown(delay);
         }
         Ok(Transfer::new(response, permit))
+    }
+
+    /// Opens a URL that did not come from `fs/link`. See [`Client::open_url`].
+    async fn open_url(&self, url: &Url, headers: &HeaderMap) -> Result<Transfer, Error> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Error::InvalidPath {
+                path: url.path().to_owned(),
+            });
+        }
+        let label = url.path();
+        let on_server = url.origin() == self.base.origin();
+        let mut budget = WaitBudget::new(self.config.cooldown_budget);
+        // The transfer slot comes first, so a request waiting for one does
+        // not hold an API slot that listings need.
+        let permit = self.transfer_slot(&mut budget).await?;
+        let mut request = self.transfer.get(url.clone()).headers(headers.clone());
+        let api_permit = if on_server {
+            let (token, _) = self.token(&mut budget).await?;
+            // reqwest drops Authorization when a redirect leaves this host,
+            // so the provider host never sees the token.
+            request = request.header(AUTHORIZATION, token);
+            Some(
+                self.admission
+                    .acquire(RequestClass::Link, &mut budget)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(|error| Error::transport(label, error))?;
+        // OpenList has answered or redirected, so the provider call it made
+        // is over. The body may take minutes and must not hold an API slot.
+        drop(api_permit);
+        let answered_by_server = response.url().origin() == self.base.origin();
+        if let Some(delay) = self.requested_pause(&response) {
+            if answered_by_server {
+                self.admission.extend_cooldown(delay);
+            } else {
+                self.admission.extend_transfer_cooldown(delay);
+            }
+        }
+        if on_server {
+            let status = response.status();
+            if !answered_by_server || status.is_success() {
+                self.admission.on_success(RequestClass::Link);
+            } else if matches!(status.as_u16(), 500 | 502..=504 | 506..=599) {
+                // As for fs/link, OpenList may relay 115's throttling as a
+                // bare 5xx.
+                self.admission.on_throttle(RequestClass::Link);
+            }
+        }
+        Ok(Transfer::new(response, permit))
+    }
+
+    /// Waits for a transfer slot. Transfers honour the client-wide pause
+    /// like API calls, checked again after the slot wait for the same
+    /// reason as in admission.
+    async fn transfer_slot(
+        &self,
+        budget: &mut WaitBudget,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
+        self.admission.wait_transfer_cooldown(budget).await?;
+        let Ok(permit) = Arc::clone(&self.transfers).acquire_owned().await else {
+            unreachable!("the transfer semaphore is never closed");
+        };
+        self.admission.wait_transfer_cooldown(budget).await?;
+        Ok(permit)
     }
 
     /// How long a 429 or 503 response asks the client to pause.
