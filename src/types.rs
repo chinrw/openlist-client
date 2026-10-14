@@ -157,13 +157,18 @@ pub struct PartialWalk {
     /// Directories that could not be listed, sorted by path, with the
     /// reason. Nothing below them is in `entries`.
     pub failed: Vec<(String, Error)>,
+    /// Paths whose name occurs more than once in its directory, sorted.
+    /// OpenList resolves such a path to only one of the copies, so none of
+    /// them is in `entries` and nothing below them was walked.
+    pub ambiguous: Vec<String>,
 }
 
 impl PartialWalk {
-    /// Whether every directory below the root was listed. Only then may a
-    /// caller treat a path missing from `entries` as gone.
+    /// Whether every directory below the root was listed and every name was
+    /// unique. Only then may a caller treat a path missing from `entries` as
+    /// gone.
     pub fn is_complete(&self) -> bool {
-        self.failed.is_empty()
+        self.failed.is_empty() && self.ambiguous.is_empty()
     }
 }
 

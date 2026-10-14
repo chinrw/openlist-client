@@ -60,8 +60,11 @@ outside 2xx into `Error::Http` with the start of the error page.
 
 `Client::walk` fails as a whole when any directory fails. `Client::walk_partial`
 records a directory it cannot list in `PartialWalk::failed` and goes on, and
-stops only when the wait budget runs out or OpenList refuses the login. Treat a
-path missing from an incomplete walk as unknown, not as deleted.
+stops only when the wait budget runs out or OpenList refuses the login. A name
+that repeats in its directory, which 115 allows, goes into
+`PartialWalk::ambiguous` and is not walked, because OpenList resolves its path
+to only one copy. Treat a path missing from an incomplete walk as unknown, not
+as deleted.
 
 File transfers never connect to a loopback or link-local address, such as
 `127.0.0.1` or `169.254.169.254`, unless it is OpenList's own address and port.

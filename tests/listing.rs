@@ -393,6 +393,30 @@ async fn walk_partial_records_a_failed_directory_and_lists_the_rest() {
 }
 
 #[tokio::test]
+async fn walk_partial_skips_repeated_names_without_walking_them() {
+    let server = start().await;
+    server.fake.put(
+        "/lib",
+        vec![dir("dup"), file("dup", 1), file("keep", 1), dir("sub")],
+    );
+    server.fake.put("/lib/dup", vec![file("inside", 1)]);
+    server.fake.put("/lib/sub", vec![file("1", 1)]);
+    let client = server.client();
+    let walk = client.walk_partial("/lib", |_| {}).await.unwrap();
+
+    assert!(!walk.is_complete());
+    assert_eq!(walk.ambiguous, ["/lib/dup"]);
+    assert!(walk.failed.is_empty());
+    let paths: Vec<_> = walk.entries.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["/lib/keep", "/lib/sub", "/lib/sub/1"]);
+    assert_eq!(server.fake.hits("list", "/lib/dup"), 0);
+
+    // A full walk leaves the decision to the caller.
+    let found = client.walk("/lib").await.unwrap();
+    assert_eq!(found.iter().filter(|f| f.path == "/lib/dup").count(), 2);
+}
+
+#[tokio::test]
 async fn walk_partial_records_a_failed_root() {
     let server = start().await;
     let client = server.client();

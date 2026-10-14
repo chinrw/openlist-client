@@ -221,7 +221,9 @@ fn has_marker(text: &str, markers: &[&str]) -> bool {
 /// Keeps a bounded, single-line copy of an error body for logs.
 pub(crate) fn clean_body(bytes: &[u8]) -> String {
     const MAX_CHARS: usize = 1024;
-    let text = String::from_utf8_lossy(bytes);
+    // Markup can split a marker, as in "object <b>not found</b>", so the
+    // markers below are looked for in the text without tags.
+    let text = strip_tags(&String::from_utf8_lossy(bytes));
     let mut out = String::new();
     let mut last_space = true;
     for ch in text.chars().take(MAX_CHARS) {
@@ -260,6 +262,31 @@ pub(crate) fn clean_body(bytes: &[u8]) -> String {
         if text.contains(marker) && !out.contains(marker) {
             out.push_str(" ... ");
             out.push_str(marker);
+        }
+    }
+    out
+}
+
+/// Drops every HTML tag, comment and doctype. A `<` that does not start one,
+/// as in "size 5 < 10", is kept. Tags leave no space behind, so a marker
+/// split by inline markup, as in "违规<i>内容</i>", is whole again.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_tag = false;
+    while let Some(ch) = chars.next() {
+        if in_tag {
+            in_tag = ch != '>';
+            continue;
+        }
+        let opens_tag = ch == '<'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphabetic() || matches!(next, '/' | '!' | '?'));
+        if opens_tag {
+            in_tag = true;
+        } else {
+            out.push(ch);
         }
     }
     out
@@ -368,5 +395,18 @@ mod tests {
             clean_body(b"failed: https://cdn.example/f?sig=secret gone"),
             "failed: <url> gone"
         );
+    }
+
+    #[test]
+    fn clean_body_strips_markup_around_markers() {
+        let page = b"<!DOCTYPE html>\n<html><body>\n<h1>500</h1>\n\
+            <p>failed link: object <b>not found</b></p>\n</body></html>";
+        let cleaned = clean_body(page);
+        assert_eq!(cleaned, "500 failed link: object not found");
+        assert!(!http(500, &cleaned).is_retryable());
+        let mut long = vec![b'x'; 5000];
+        long.extend_from_slice(b"<p>\xe8\xbf\x9d\xe8\xa7\x84<i>\xe5\x86\x85\xe5\xae\xb9</i></p>");
+        assert!(http(403, &clean_body(&long)).is_blocked());
+        assert_eq!(clean_body(b"size 5 < 10"), "size 5 < 10");
     }
 }

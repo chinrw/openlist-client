@@ -382,15 +382,16 @@ impl Client {
     /// As [`Client::list`], for every directory below the root.
     pub async fn walk_from(&self, root: Arc<Listing>) -> Result<Vec<WalkEntry>, Error> {
         let walk = self
-            .walk_until(root.path.clone(), Some(root), |_| {}, |_| true)
+            .walk_until(root.path.clone(), Some(root), |_| {}, false)
             .await?;
         Ok(walk.entries)
     }
 
     /// Like [`Client::walk`], but a directory that cannot be listed goes into
     /// [`PartialWalk::failed`] and the walk goes on, so one bad directory
-    /// does not hide the rest of the tree. `on_listing` sees every listing
-    /// as it arrives, for progress.
+    /// does not hide the rest of the tree. A name that repeats in its
+    /// directory goes into [`PartialWalk::ambiguous`] and is not walked.
+    /// `on_listing` sees every listing as it arrives, for progress.
     ///
     /// # Errors
     /// [`Error::RateLimited`] and [`Error::Login`] end the walk, because
@@ -402,7 +403,7 @@ impl Client {
         on_listing: impl FnMut(&Listing),
     ) -> Result<PartialWalk, Error> {
         let root = path::normalize(root)?;
-        self.walk_until(root, None, on_listing, ends_walk).await
+        self.walk_until(root, None, on_listing, true).await
     }
 
     /// Like [`Client::walk_partial`], starting from a root listing the
@@ -415,19 +416,19 @@ impl Client {
         root: Arc<Listing>,
         on_listing: impl FnMut(&Listing),
     ) -> Result<PartialWalk, Error> {
-        self.walk_until(root.path.clone(), Some(root), on_listing, ends_walk)
+        self.walk_until(root.path.clone(), Some(root), on_listing, true)
             .await
     }
 
     /// Lists `root` and everything below it, with up to `list_concurrency`
-    /// listings in flight. A failure for which `fatal` holds ends the walk.
-    /// Any other is recorded and the walk goes on.
+    /// listings in flight. Without `partial`, any failure ends the walk and
+    /// repeated names are walked like others.
     async fn walk_until(
         &self,
         root: String,
         seed: Option<Arc<Listing>>,
         mut on_listing: impl FnMut(&Listing),
-        fatal: impl Fn(&Error) -> bool,
+        partial: bool,
     ) -> Result<PartialWalk, Error> {
         let mut visited = HashSet::from([root.clone()]);
         let mut queue = VecDeque::new();
@@ -438,9 +439,10 @@ impl Client {
                 let error = match listing {
                     Ok(listing) => {
                         on_listing(&listing);
-                        match collect(&listing, queue, &mut visited) {
-                            Ok(entries) => {
+                        match collect(&listing, queue, &mut visited, partial) {
+                            Ok((entries, ambiguous)) => {
                                 walk.entries.extend(entries);
+                                walk.ambiguous.extend(ambiguous);
                                 return Ok(());
                             }
                             Err(error) => error,
@@ -448,7 +450,7 @@ impl Client {
                     }
                     Err(error) => error,
                 };
-                if fatal(&error) {
+                if !partial || ends_walk(&error) {
                     return Err(error);
                 }
                 walk.failed.push((dir, error));
@@ -479,6 +481,7 @@ impl Client {
         // Listings finish in any order.
         walk.entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         walk.failed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        walk.ambiguous.sort_unstable();
         Ok(walk)
     }
 
@@ -603,27 +606,44 @@ fn ends_walk(error: &Error) -> bool {
 
 /// A listing's entries with their paths, queueing subdirectories not seen
 /// yet. Nothing is queued if a name cannot be joined.
+///
+/// With `skip_repeated`, a name that occurs more than once is returned
+/// apart as ambiguous and not queued: OpenList resolves its path to only one
+/// of the copies.
 fn collect(
     listing: &Listing,
     queue: &mut VecDeque<String>,
     visited: &mut HashSet<String>,
-) -> Result<Vec<WalkEntry>, Error> {
-    let entries = listing
+    skip_repeated: bool,
+) -> Result<(Vec<WalkEntry>, Vec<String>), Error> {
+    let mut seen = HashSet::new();
+    let repeated: HashSet<&str> = listing
         .entries
         .iter()
-        .map(|entry| {
-            Ok(WalkEntry {
-                path: path::join(&listing.path, &entry.name)?,
-                entry: entry.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
+        .map(|entry| entry.name.as_str())
+        .filter(|name| skip_repeated && !seen.insert(*name))
+        .collect();
+    let mut entries = Vec::new();
+    let mut ambiguous = Vec::new();
+    for entry in &listing.entries {
+        let path = path::join(&listing.path, &entry.name)?;
+        if repeated.contains(entry.name.as_str()) {
+            if !ambiguous.contains(&path) {
+                ambiguous.push(path);
+            }
+            continue;
+        }
+        entries.push(WalkEntry {
+            path,
+            entry: entry.clone(),
+        });
+    }
     for found in &entries {
         if found.entry.is_dir && visited.insert(found.path.clone()) {
             queue.push_back(found.path.clone());
         }
     }
-    Ok(entries)
+    Ok((entries, ambiguous))
 }
 
 impl Inner {
