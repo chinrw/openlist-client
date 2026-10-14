@@ -326,3 +326,66 @@ async fn a_provider_pause_beyond_the_budget_is_rate_limited_before_capping() {
     let error = client.open_url(&url, &HeaderMap::new()).await.unwrap_err();
     assert!(matches!(error, Error::RateLimited), "{error:?}");
 }
+
+#[tokio::test]
+async fn error_for_status_classifies_a_provider_error_page() {
+    let server = start().await;
+    let client = server.client();
+    let url: Url = format!("{}/raw/w/a.mp3", server.fake.other_host())
+        .parse()
+        .unwrap();
+    let headers = HeaderMap::new();
+
+    let transfer = client.open_url(&url, &headers).await.unwrap();
+    let transfer = transfer.error_for_status().await.unwrap();
+    assert_eq!(body(transfer).await, "contents of /w/a.mp3");
+
+    // The marker sits past the first kilobyte, as in a long HTML page.
+    let page: &'static str = Box::leak(
+        format!(
+            "<html>{}failed link: object not found</html>",
+            " ".repeat(4000)
+        )
+        .into_boxed_str(),
+    );
+    server
+        .fake
+        .fault("raw", "/w/a.mp3", Fault::StatusBody(500, page));
+    let error = client
+        .open_url(&url, &headers)
+        .await
+        .unwrap()
+        .error_for_status()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Http { status: 500, path, .. } if path == "/raw/w/a.mp3"),
+        "{error:?}"
+    );
+    assert!(!error.is_retryable(), "a missing object is permanent");
+
+    server
+        .fake
+        .fault("raw", "/w/a.mp3", Fault::StatusBody(403, "违规内容"));
+    let error = client
+        .open_url(&url, &headers)
+        .await
+        .unwrap()
+        .error_for_status()
+        .await
+        .unwrap_err();
+    assert!(error.is_blocked(), "{error:?}");
+
+    server
+        .fake
+        .fault("raw", "/w/a.mp3", Fault::Status(503, None));
+    let error = client
+        .open_url(&url, &headers)
+        .await
+        .unwrap()
+        .error_for_status()
+        .await
+        .unwrap_err();
+    assert!(error.is_retryable(), "{error:?}");
+    assert!(!error.is_blocked());
+}

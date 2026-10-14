@@ -5,7 +5,10 @@ use futures_util::stream::{Stream, StreamExt};
 use reqwest::{StatusCode, header::HeaderMap};
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::Error;
+use crate::{
+    Error,
+    error::{clean_body, error_prefix},
+};
 
 /// A response from the provider for [`crate::Client::open`].
 ///
@@ -14,11 +17,22 @@ use crate::Error;
 pub struct Transfer {
     response: reqwest::Response,
     permit: OwnedSemaphorePermit,
+    /// For errors. The URL's path without its query, which can carry a
+    /// signature.
+    path: String,
 }
 
 impl Transfer {
-    pub(crate) fn new(response: reqwest::Response, permit: OwnedSemaphorePermit) -> Self {
-        Self { response, permit }
+    pub(crate) fn new(
+        response: reqwest::Response,
+        permit: OwnedSemaphorePermit,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            response,
+            permit,
+            path: path.into(),
+        }
     }
 
     pub fn status(&self) -> StatusCode {
@@ -27,6 +41,27 @@ impl Transfer {
 
     pub fn headers(&self) -> &HeaderMap {
         self.response.headers()
+    }
+
+    /// Passes a 2xx response through and turns any other status into
+    /// [`Error::Http`] carrying the start of the body, so a download failure
+    /// classifies like an API one: [`Error::is_retryable`] and
+    /// [`Error::is_blocked`] read the provider's markers in it.
+    ///
+    /// # Errors
+    /// [`Error::Http`] for a status outside 2xx, including a 304 the caller
+    /// asked for with a conditional header.
+    pub async fn error_for_status(mut self) -> Result<Self, Error> {
+        let status = self.status();
+        if status.is_success() {
+            return Ok(self);
+        }
+        let body = clean_body(&error_prefix(&mut self.response).await);
+        Err(Error::Http {
+            status: status.as_u16(),
+            path: self.path,
+            body,
+        })
     }
 
     /// Reads the next chunk of the body. `None` means the body is complete.

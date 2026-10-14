@@ -21,8 +21,9 @@ pub enum Error {
         path: String,
         message: String,
     },
-    /// The HTTP status was not a success.
-    #[error("OpenList returned HTTP {status} for {path}")]
+    /// The HTTP status was not a success. It comes from OpenList, or from
+    /// the provider for [`crate::Transfer::error_for_status`].
+    #[error("HTTP {status} for {path}")]
     Http {
         status: u16,
         path: String,
@@ -125,8 +126,13 @@ impl Error {
         }
     }
 
-    /// Whether the same request may succeed if sent again.
-    pub(crate) fn is_retryable(&self) -> bool {
+    /// Whether the same request may succeed if sent again: a transient 5xx,
+    /// 408 or 429, or a connection that failed. A missing object or blocked
+    /// content never qualifies, whatever the status.
+    ///
+    /// The client already retried API calls, so callers use this for what
+    /// it does not retry, such as reading a [`crate::Transfer`].
+    pub fn is_retryable(&self) -> bool {
         match self {
             Self::Api { code, message, .. } => {
                 *code == 500
@@ -140,6 +146,16 @@ impl Error {
                     && !body.contains(NOT_FOUND_MARKER)
             }
             Self::Transport { retryable, .. } => *retryable,
+            _ => false,
+        }
+    }
+
+    /// Whether the provider refused the content itself, as 115 does with
+    /// 违规内容. Retrying or refreshing the link never helps.
+    pub fn is_blocked(&self) -> bool {
+        match self {
+            Self::Api { message, .. } => has_marker(message, PERMANENT_MARKERS),
+            Self::Http { body, .. } => has_marker(body, PERMANENT_MARKERS),
             _ => false,
         }
     }
@@ -179,6 +195,23 @@ impl Error {
             message: message.into(),
         }
     }
+}
+
+/// Bytes of a failed response read for classification. Error pages can be
+/// long HTML whose only signal comes late.
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
+
+/// Reads the start of an error response's body, for [`clean_body`].
+pub(crate) async fn error_prefix(response: &mut reqwest::Response) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    while prefix.len() < ERROR_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => prefix.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    prefix.truncate(ERROR_BODY_LIMIT);
+    prefix
 }
 
 fn has_marker(text: &str, markers: &[&str]) -> bool {
@@ -286,6 +319,14 @@ mod tests {
             assert!(!http(status, "").is_retryable(), "{status}");
         }
         assert!(!http(500, "failed link: object not found").is_retryable());
+    }
+
+    #[test]
+    fn blocked_content_is_recognized_in_messages_and_bodies() {
+        assert!(api(500, "failed get link: 违规内容").is_blocked());
+        assert!(http(403, "<p>违规内容</p>").is_blocked());
+        assert!(!http(500, "upstream overloaded").is_blocked());
+        assert!(!Error::RateLimited.is_blocked());
     }
 
     #[test]

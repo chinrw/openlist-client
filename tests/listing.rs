@@ -361,6 +361,88 @@ async fn walk_fails_as_a_whole_when_one_directory_fails() {
 }
 
 #[tokio::test]
+async fn walk_partial_records_a_failed_directory_and_lists_the_rest() {
+    let server = start().await;
+    server
+        .fake
+        .put("/lib", vec![dir("a"), dir("b"), file("top", 1)]);
+    server.fake.put("/lib/a", vec![dir("deep"), file("1", 1)]);
+    server.fake.put("/lib/a/deep", vec![file("2", 1)]);
+    server.fake.put("/lib/b", vec![file("1", 1)]);
+    for _ in 0..3 {
+        server
+            .fake
+            .fault("list", "/lib/a", Fault::Status(500, None));
+    }
+    let client = server.client();
+    let mut listed = Vec::new();
+    let walk = client
+        .walk_partial("/lib/", |listing| listed.push(listing.path.clone()))
+        .await
+        .unwrap();
+
+    assert!(!walk.is_complete());
+    let failed: Vec<_> = walk.failed.iter().map(|(dir, _)| dir.as_str()).collect();
+    assert_eq!(failed, ["/lib/a"]);
+    assert_eq!(walk.failed[0].1.kind(), ErrorKind::Unavailable);
+    let paths: Vec<_> = walk.entries.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["/lib/a", "/lib/b", "/lib/b/1", "/lib/top"]);
+    listed.sort();
+    assert_eq!(listed, ["/lib", "/lib/b"]);
+    assert_eq!(server.fake.hits("list", "/lib/a/deep"), 0);
+}
+
+#[tokio::test]
+async fn walk_partial_records_a_failed_root() {
+    let server = start().await;
+    let client = server.client();
+    let walk = client.walk_partial("/gone", |_| {}).await.unwrap();
+    assert!(walk.entries.is_empty());
+    let failed: Vec<_> = walk.failed.iter().map(|(dir, _)| dir.as_str()).collect();
+    assert_eq!(failed, ["/gone"]);
+}
+
+#[tokio::test]
+async fn walk_partial_stops_when_the_wait_budget_runs_out() {
+    let server = start().await;
+    server.fake.put("/lib", vec![dir("a")]);
+    server.fake.put("/lib/a", vec![file("1", 1)]);
+    server
+        .fake
+        .fault("list", "/lib/a", Fault::Status(503, Some("3600")));
+    let client = server.client();
+    let error = client.walk_partial("/lib", |_| {}).await.unwrap_err();
+    assert!(matches!(error, Error::RateLimited), "{error:?}");
+}
+
+#[tokio::test]
+async fn walk_partial_stops_when_the_login_is_refused() {
+    let server = start().await;
+    server.fake.put("/lib", vec![dir("a")]);
+    let client = Client::new(server.token_config("revoked-token")).unwrap();
+    let error = client.walk_partial("/lib", |_| {}).await.unwrap_err();
+    assert!(matches!(error, Error::Login { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn walk_partial_from_starts_at_the_given_listing() {
+    let server = start().await;
+    server.fake.put("/lib", vec![dir("a")]);
+    server.fake.put("/lib/a", vec![file("1", 1)]);
+    let client = server.client();
+    let root = client.refresh("/lib").await.unwrap();
+    let walk = client.walk_partial_from(root, |_| {}).await.unwrap();
+    assert!(walk.is_complete());
+    let paths: Vec<_> = walk.entries.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["/lib/a", "/lib/a/1"]);
+    assert_eq!(
+        server.fake.hits("list", "/lib"),
+        1,
+        "the seed is not listed again"
+    );
+}
+
+#[tokio::test]
 async fn digest_lets_a_second_scan_skip_an_unchanged_work() {
     let server = start().await;
     server

@@ -51,4 +51,4 @@ pub use client::Client;
 pub use config::{Auth, Config, ConfigError};
 pub use error::{Error, ErrorKind};
 pub use transfer::Transfer;
-pub use types::{Entry, FileInfo, Link, Listing, ListingDigest, WalkEntry};
+pub use types::{Entry, FileInfo, Link, Listing, ListingDigest, PartialWalk, WalkEntry};

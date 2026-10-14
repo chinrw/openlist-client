@@ -19,10 +19,11 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    Auth, Config, ConfigError, Entry, Error, FileInfo, Link, Listing, Transfer, WalkEntry,
+    Auth, Config, ConfigError, Entry, Error, FileInfo, Link, Listing, PartialWalk, Transfer,
+    WalkEntry,
     admission::{Admission, Limits, Permit, WaitBudget, retry_after},
     cache::Cache,
-    error::{NOT_FOUND_MARKER, clean_body},
+    error::{NOT_FOUND_MARKER, clean_body, error_prefix},
     guard::Guard,
     limit::RequestClass,
     path,
@@ -39,9 +40,6 @@ const ENVELOPE_429_PAUSE: Duration = Duration::from_secs(60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// Redirects followed below OpenList before giving up, as reqwest's default.
 const MAX_REDIRECTS: usize = 10;
-/// Bytes of a failed response read for classification. Error pages can be
-/// long HTML whose only signal comes late.
-const ERROR_BODY_LIMIT: usize = 64 * 1024;
 
 /// An OpenList client. Clones share one connection pool, one set of rate
 /// limits and one set of caches, so create one per OpenList server.
@@ -383,10 +381,83 @@ impl Client {
     /// # Errors
     /// As [`Client::list`], for every directory below the root.
     pub async fn walk_from(&self, root: Arc<Listing>) -> Result<Vec<WalkEntry>, Error> {
-        let mut visited = HashSet::from([root.path.clone()]);
+        let walk = self
+            .walk_until(root.path.clone(), Some(root), |_| {}, |_| true)
+            .await?;
+        Ok(walk.entries)
+    }
+
+    /// Like [`Client::walk`], but a directory that cannot be listed goes into
+    /// [`PartialWalk::failed`] and the walk goes on, so one bad directory
+    /// does not hide the rest of the tree. `on_listing` sees every listing
+    /// as it arrives, for progress.
+    ///
+    /// # Errors
+    /// [`Error::RateLimited`] and [`Error::Login`] end the walk, because
+    /// every remaining listing would fail the same way. [`Error::InvalidPath`]
+    /// for a `root` that cannot be sent.
+    pub async fn walk_partial(
+        &self,
+        root: &str,
+        on_listing: impl FnMut(&Listing),
+    ) -> Result<PartialWalk, Error> {
+        let root = path::normalize(root)?;
+        self.walk_until(root, None, on_listing, ends_walk).await
+    }
+
+    /// Like [`Client::walk_partial`], starting from a root listing the
+    /// caller already has, such as one from [`Client::refresh`].
+    ///
+    /// # Errors
+    /// As [`Client::walk_partial`].
+    pub async fn walk_partial_from(
+        &self,
+        root: Arc<Listing>,
+        on_listing: impl FnMut(&Listing),
+    ) -> Result<PartialWalk, Error> {
+        self.walk_until(root.path.clone(), Some(root), on_listing, ends_walk)
+            .await
+    }
+
+    /// Lists `root` and everything below it, with up to `list_concurrency`
+    /// listings in flight. A failure for which `fatal` holds ends the walk.
+    /// Any other is recorded and the walk goes on.
+    async fn walk_until(
+        &self,
+        root: String,
+        seed: Option<Arc<Listing>>,
+        mut on_listing: impl FnMut(&Listing),
+        fatal: impl Fn(&Error) -> bool,
+    ) -> Result<PartialWalk, Error> {
+        let mut visited = HashSet::from([root.clone()]);
         let mut queue = VecDeque::new();
-        let mut found = Vec::new();
-        collect(&root, &mut found, &mut queue, &mut visited)?;
+        let mut walk = PartialWalk::default();
+        // The queue is passed in because the loop below also drains it.
+        let mut found =
+            |queue: &mut VecDeque<String>, dir: String, listing: Result<Arc<Listing>, Error>| {
+                let error = match listing {
+                    Ok(listing) => {
+                        on_listing(&listing);
+                        match collect(&listing, queue, &mut visited) {
+                            Ok(entries) => {
+                                walk.entries.extend(entries);
+                                return Ok(());
+                            }
+                            Err(error) => error,
+                        }
+                    }
+                    Err(error) => error,
+                };
+                if fatal(&error) {
+                    return Err(error);
+                }
+                walk.failed.push((dir, error));
+                Ok(())
+            };
+        match seed {
+            Some(listing) => found(&mut queue, root, Ok(listing))?,
+            None => queue.push_back(root),
+        }
         let mut in_flight = FuturesUnordered::new();
         loop {
             while in_flight.len() < self.inner.config.list_concurrency {
@@ -394,17 +465,21 @@ impl Client {
                     break;
                 };
                 let client = self.clone();
-                in_flight.push(async move { client.list(&dir).await });
+                in_flight.push(async move {
+                    let listing = client.list(&dir).await;
+                    (dir, listing)
+                });
             }
-            let Some(listing) = in_flight.next().await else {
+            let Some((dir, listing)) = in_flight.next().await else {
                 break;
             };
-            let listing = listing?;
-            collect(&listing, &mut found, &mut queue, &mut visited)?;
+            found(&mut queue, dir, listing)?;
         }
+        drop(found);
         // Listings finish in any order.
-        found.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-        Ok(found)
+        walk.entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        walk.failed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Ok(walk)
     }
 
     /// Opens a file for reading through its direct link, forwarding
@@ -512,18 +587,6 @@ fn redirect_target(response: &reqwest::Response) -> Option<Url> {
 }
 
 /// The start of a failed response's body, kept for logs and classification.
-async fn error_prefix(response: &mut reqwest::Response) -> Vec<u8> {
-    let mut prefix = Vec::new();
-    while prefix.len() < ERROR_BODY_LIMIT {
-        match response.chunk().await {
-            Ok(Some(chunk)) => prefix.extend_from_slice(&chunk),
-            _ => break,
-        }
-    }
-    prefix.truncate(ERROR_BODY_LIMIT);
-    prefix
-}
-
 fn local_target(path: &str) -> Error {
     Error::protocol(path, "the link points at a local address")
 }
@@ -532,23 +595,35 @@ fn link_rejected(status: StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 403 | 404)
 }
 
+/// The failures after which a partial walk stops: every remaining listing
+/// would fail the same way.
+fn ends_walk(error: &Error) -> bool {
+    matches!(error, Error::RateLimited | Error::Login { .. })
+}
+
+/// A listing's entries with their paths, queueing subdirectories not seen
+/// yet. Nothing is queued if a name cannot be joined.
 fn collect(
     listing: &Listing,
-    found: &mut Vec<WalkEntry>,
     queue: &mut VecDeque<String>,
     visited: &mut HashSet<String>,
-) -> Result<(), Error> {
-    for entry in &listing.entries {
-        let path = path::join(&listing.path, &entry.name)?;
-        if entry.is_dir && visited.insert(path.clone()) {
-            queue.push_back(path.clone());
+) -> Result<Vec<WalkEntry>, Error> {
+    let entries = listing
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok(WalkEntry {
+                path: path::join(&listing.path, &entry.name)?,
+                entry: entry.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    for found in &entries {
+        if found.entry.is_dir && visited.insert(found.path.clone()) {
+            queue.push_back(found.path.clone());
         }
-        found.push(WalkEntry {
-            path,
-            entry: entry.clone(),
-        });
     }
-    Ok(())
+    Ok(entries)
 }
 
 impl Inner {
@@ -674,7 +749,7 @@ impl Inner {
         if let Some(delay) = self.requested_pause(&response) {
             self.admission.extend_transfer_cooldown(delay);
         }
-        Ok(Transfer::new(response, permit))
+        Ok(Transfer::new(response, permit, path))
     }
 
     /// Opens a URL that did not come from `fs/link`. See [`Client::open_url`].
@@ -761,7 +836,7 @@ impl Inner {
             }
             match redirect_target(&response) {
                 Some(next) => url = next,
-                None => return Ok(Transfer::new(response, permit)),
+                None => return Ok(Transfer::new(response, permit, url.path())),
             }
         }
         Err(Error::protocol(url.path(), "too many redirects"))

@@ -149,6 +149,24 @@ pub struct WalkEntry {
     pub entry: Entry,
 }
 
+/// What [`crate::Client::walk_partial`] found.
+#[derive(Debug, Default)]
+pub struct PartialWalk {
+    /// Entries of every directory that could be listed, sorted by path.
+    pub entries: Vec<WalkEntry>,
+    /// Directories that could not be listed, sorted by path, with the
+    /// reason. Nothing below them is in `entries`.
+    pub failed: Vec<(String, Error)>,
+}
+
+impl PartialWalk {
+    /// Whether every directory below the root was listed. Only then may a
+    /// caller treat a path missing from `entries` as gone.
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
 // The Debug output below leaves out signatures and the query strings of
 // signed links, so a value can be logged without handing out access.
 

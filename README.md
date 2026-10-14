@@ -51,6 +51,18 @@ whose base path is `/`. `Client::open_url` opens a `raw_url` from `Client::get`
 or an OpenList `/d` link and works with any account. It sends the token only to
 URLs below the configured base URL.
 
+A `Transfer` carries the provider's status as it is, so a proxy can forward
+it. A downloader calls `Transfer::error_for_status`, which turns a status
+outside 2xx into `Error::Http` with the start of the error page.
+`Error::is_retryable` then tells a passing fault from a missing object, and
+`Error::is_blocked` reports content the provider refuses, such as 115's
+违规内容.
+
+`Client::walk` fails as a whole when any directory fails. `Client::walk_partial`
+records a directory it cannot list in `PartialWalk::failed` and goes on, and
+stops only when the wait budget runs out or OpenList refuses the login. Treat a
+path missing from an incomplete walk as unknown, not as deleted.
+
 File transfers never connect to a loopback or link-local address, such as
 `127.0.0.1` or `169.254.169.254`, unless it is OpenList's own address and port.
 Links come from OpenList, so this keeps a hostile OpenList from pointing the
