@@ -221,23 +221,11 @@ fn has_marker(text: &str, markers: &[&str]) -> bool {
 /// Keeps a bounded, single-line copy of an error body for logs.
 pub(crate) fn clean_body(bytes: &[u8]) -> String {
     const MAX_CHARS: usize = 1024;
-    // Markup can split a marker, as in "object <b>not found</b>", so the
-    // markers below are looked for in the text without tags.
-    let text = strip_tags(&String::from_utf8_lossy(bytes));
-    let mut out = String::new();
-    let mut last_space = true;
-    for ch in text.chars().take(MAX_CHARS) {
-        // Control characters could inject terminal escapes into logs.
-        if ch.is_whitespace() || ch.is_control() {
-            if !last_space {
-                out.push(' ');
-                last_space = true;
-            }
-        } else {
-            out.push(ch);
-            last_space = false;
-        }
-    }
+    // Markup and line breaks can split a marker, as in
+    // "object <b>not\nfound</b>", so the whole prefix is normalized before
+    // it is cut and searched.
+    let text = collapse_whitespace(&strip_tags(&String::from_utf8_lossy(bytes)));
+    let mut out: String = text.chars().take(MAX_CHARS).collect();
     out.truncate(out.trim_end().len());
     // Error pages and driver messages sometimes quote a signed link, and
     // these strings end up in Debug output and logs.
@@ -264,6 +252,27 @@ pub(crate) fn clean_body(bytes: &[u8]) -> String {
             out.push_str(marker);
         }
     }
+    out
+}
+
+/// Turns every run of whitespace and control characters into one space and
+/// trims the ends. Control characters could inject terminal escapes into
+/// logs.
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_space = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+    out.truncate(out.trim_end().len());
     out
 }
 
@@ -408,5 +417,12 @@ mod tests {
         long.extend_from_slice(b"<p>\xe8\xbf\x9d\xe8\xa7\x84<i>\xe5\x86\x85\xe5\xae\xb9</i></p>");
         assert!(http(403, &clean_body(&long)).is_blocked());
         assert_eq!(clean_body(b"size 5 < 10"), "size 5 < 10");
+        // Padding and a line break inside the marker, past the cut.
+        let mut padded = vec![b' '; 2000];
+        padded.extend_from_slice(b"<p>object\nnot found</p>");
+        assert_eq!(clean_body(&padded), "object not found");
+        let mut long = vec![b'x'; 2000];
+        long.extend_from_slice(b"\n<p>failed link: object\n  not found</p>");
+        assert!(!http(500, &clean_body(&long)).is_retryable());
     }
 }
