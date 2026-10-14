@@ -623,20 +623,19 @@ fn collect(
         .map(|entry| entry.name.as_str())
         .filter(|name| skip_repeated && !seen.insert(*name))
         .collect();
+    let ambiguous = repeated
+        .iter()
+        .map(|name| path::join(&listing.path, name))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut entries = Vec::new();
-    let mut ambiguous = Vec::new();
     for entry in &listing.entries {
         let path = path::join(&listing.path, &entry.name)?;
-        if repeated.contains(entry.name.as_str()) {
-            if !ambiguous.contains(&path) {
-                ambiguous.push(path);
-            }
-            continue;
+        if !repeated.contains(entry.name.as_str()) {
+            entries.push(WalkEntry {
+                path,
+                entry: entry.clone(),
+            });
         }
-        entries.push(WalkEntry {
-            path,
-            entry: entry.clone(),
-        });
     }
     for found in &entries {
         if found.entry.is_dir && visited.insert(found.path.clone()) {
@@ -1169,5 +1168,45 @@ impl Inner {
             .unwrap_or(0);
         let ceiling_micros = u64::try_from(ceiling.as_micros()).unwrap_or(u64::MAX);
         Duration::from_micros(entropy % ceiling_micros.saturating_add(1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_handles_many_repeated_names_in_linear_time() {
+        // 115 allows repeated names, and a listing may hold 200 000 entries.
+        let pairs = 50_000;
+        let entries = (0..pairs)
+            .flat_map(|i| {
+                let entry = Entry {
+                    name: format!("{i:06}.mp3"),
+                    is_dir: false,
+                    size: 1,
+                    modified: None,
+                    sign: String::new(),
+                    hashes: Default::default(),
+                };
+                [entry.clone(), entry]
+            })
+            .collect();
+        let listing = Listing {
+            path: "/big".into(),
+            entries,
+            provider: "test".into(),
+            fetched_at: Instant::now(),
+        };
+        let started = Instant::now();
+        let (found, ambiguous) =
+            collect(&listing, &mut VecDeque::new(), &mut HashSet::new(), true).unwrap();
+        assert!(found.is_empty());
+        assert_eq!(ambiguous.len(), pairs);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }
